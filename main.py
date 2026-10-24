@@ -71,7 +71,6 @@ class PranaApp:
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         self.attachment_paths: list[str] = []
-        self.request_pending = False
         self.conversation_id = 0
         self.closing = False
 
@@ -690,9 +689,6 @@ class PranaApp:
         ).pack()
 
     def _send_message(self) -> None:
-        if self.request_pending:
-            return
-
         message = self.input.get("1.0", tk.END).strip()
         attachment_paths = list(self.attachment_paths)
         if not message and not attachment_paths:
@@ -722,8 +718,6 @@ class PranaApp:
 
         self.history.append({"role": "user", "content": display_message})
         self._add_message("user", display_message)
-        self.request_pending = True
-        self._set_request_controls(tk.DISABLED)
         self.status.configure(text="正在等待 AI 回复…")
         conversation_id = self.conversation_id
         messages = [dict(item) for item in self.history]
@@ -863,8 +857,6 @@ class PranaApp:
         if conversation_id != self.conversation_id or self.closing:
             return
 
-        self.request_pending = False
-        self._set_request_controls(tk.NORMAL)
         self.status.configure(text=self._idle_status())
         if error is not None:
             self._add_message("assistant", f"请求失败：{error}", is_error=True)
@@ -1003,8 +995,6 @@ class PranaApp:
 
     def _clear_chat(self) -> None:
         self.conversation_id += 1
-        self.request_pending = False
-        self._set_request_controls(tk.NORMAL)
         self.status.configure(text=self._idle_status())
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
         self._clear_attachments()
