@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sys
@@ -5,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ai_client import AIClient
 
@@ -20,8 +21,8 @@ class FakeResponse:
     def __exit__(self, *_args) -> None:
         pass
 
-    def read(self) -> bytes:
-        return self.body
+    def read(self, _size: int = -1) -> bytes:
+        return self.body if _size < 0 else self.body[:_size]
 
 
 class AIClientTests(unittest.TestCase):
@@ -60,21 +61,755 @@ class AIClientTests(unittest.TestCase):
             {"model": "test-model", "messages": messages},
         )
 
+    def test_chat_request_retries_once_after_failure(self) -> None:
+        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True):
+            client = AIClient()
+        with patch.object(
+            client,
+            "_complete_message_once",
+            side_effect=[
+                RuntimeError("temporarily unavailable"),
+                {"role": "assistant", "content": "已收到"},
+            ],
+        ) as complete_once:
+            response = client._complete_message(
+                [{"role": "user", "content": "你好"}]
+            )
+
+        self.assertEqual(response["content"], "已收到")
+        self.assertEqual(complete_once.call_count, 2)
+
+    def test_chat_request_reports_error_after_retry_fails(self) -> None:
+        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True):
+            client = AIClient()
+        with patch.object(
+            client,
+            "_complete_message_once",
+            side_effect=RuntimeError("service unavailable"),
+        ) as complete_once:
+            with self.assertRaisesRegex(RuntimeError, "service unavailable"):
+                client._complete_message(
+                    [{"role": "user", "content": "你好"}]
+                )
+
+        self.assertEqual(complete_once.call_count, 2)
+
     def test_save_configuration_persists_and_updates_client(self) -> None:
         with patch("ai_client.settings_store.load_settings", return_value={}), patch(
             "ai_client.settings_store.save_settings"
         ) as save_settings:
             client = AIClient()
             client.save_configuration(
-                "  new-key  ", " https://example.test/v1/ ", " model-v2 "
+                "  new-key  ",
+                " https://example.test/v1/ ",
+                " model-v2 ",
+                review_model=" review-v1 ",
             )
 
         save_settings.assert_called_once_with(
-            "new-key", "https://example.test/v1", "model-v2", []
+            "new-key",
+            "https://example.test/v1",
+            "model-v2",
+            [],
+            "gpt-image-1",
+            "sora-2",
+            "review-v1",
         )
         self.assertEqual(client.api_key, "new-key")
         self.assertEqual(client.base_url, "https://example.test/v1")
         self.assertEqual(client.model, "model-v2")
+        self.assertEqual(client.review_model, "review-v1")
+
+    def test_generate_image_saves_returned_png(self) -> None:
+        png_data = b"\x89PNG\r\n\x1a\nimage-data"
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"PRANA_API_KEY": "test-key"}, clear=True
+        ), patch(
+            "ai_client.settings_store.settings_file_path",
+            return_value=Path(directory) / "settings.json",
+        ), patch(
+            "ai_client.AIClient._open_authenticated_request",
+            return_value=FakeResponse(
+                {
+                    "data": [
+                        {"b64_json": base64.b64encode(png_data).decode("ascii")}
+                    ]
+                }
+            ),
+        ) as urlopen:
+            client = AIClient()
+            image_path = client.generate_image("一只猫")
+            self.assertEqual(image_path.suffix, ".png")
+            self.assertEqual(image_path.read_bytes(), png_data)
+            request = urlopen.call_args.args[0]
+            self.assertTrue(request.full_url.endswith("/images/generations"))
+            self.assertEqual(
+                request.get_header("Authorization"), "Bearer test-key"
+            )
+            self.assertEqual(
+                json.loads(request.data),
+                {
+                    "model": "gpt-image-1",
+                    "prompt": "一只猫",
+                    "size": "1024x1024",
+                },
+            )
+
+    def test_generate_video_creates_polls_and_saves_video(self) -> None:
+        class BinaryResponse:
+            def __init__(self, data: bytes) -> None:
+                self.data = data
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                pass
+
+            def read(self, size: int = -1) -> bytes:
+                return self.data if size < 0 else self.data[:size]
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"PRANA_API_KEY": "test-key"}, clear=True
+        ), patch(
+            "ai_client.settings_store.settings_file_path",
+            return_value=Path(directory) / "settings.json",
+        ), patch(
+            "ai_client.AIClient._open_authenticated_request",
+            side_effect=[
+                FakeResponse({"id": "video-job"}),
+                FakeResponse({"status": "completed"}),
+                BinaryResponse(b"video-data"),
+            ],
+        ) as urlopen, patch("ai_client.time.sleep"):
+            client = AIClient()
+            video_path = client.generate_video("海边日落")
+            self.assertEqual(video_path.suffix, ".mp4")
+            self.assertEqual(video_path.read_bytes(), b"video-data")
+            create_request = urlopen.call_args_list[0].args[0]
+            self.assertTrue(create_request.full_url.endswith("/videos"))
+            self.assertEqual(
+                json.loads(create_request.data),
+                {
+                    "model": "sora-2",
+                    "prompt": "海边日落",
+                    "seconds": "4",
+                    "size": "1280x720",
+                },
+            )
+            content_request = urlopen.call_args_list[2].args[0]
+            self.assertTrue(
+                content_request.full_url.endswith("/videos/video-job/content")
+            )
+
+    def test_generate_agnes_video_sends_mode_and_downloads_result_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "ai_client.settings_store.settings_file_path",
+            return_value=Path(directory) / "settings.json",
+        ), patch("ai_client.time.sleep") as sleep:
+            client = AIClient(
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://apihub.agnes-ai.com/v1",
+                    "model": "test-model",
+                    "video_model": "agnes-video-2.5",
+                }
+            )
+            with patch.object(
+                client,
+                "_api_request",
+                side_effect=[
+                    {"video_id": "agnes-video-id", "status": "queued"},
+                    {
+                        "status": "completed",
+                        "url": "https://media.example.test/generated.mp4",
+                    },
+                ],
+            ) as api_request, patch.object(
+                client,
+                "_download_public_media",
+                return_value=b"agnes-video-data",
+            ) as download:
+                video_path = client.generate_video("海边日落")
+
+            self.assertEqual(video_path.suffix, ".mp4")
+            self.assertEqual(video_path.read_bytes(), b"agnes-video-data")
+            self.assertEqual(
+                api_request.call_args_list[0].args,
+                (
+                    "/videos",
+                    {
+                        "model": "agnes-video-2.5",
+                        "prompt": "海边日落",
+                        "seconds": "4",
+                        "size": "720P",
+                        "mode": "text",
+                        "aspect_ratio": "16:9",
+                    },
+                ),
+            )
+            self.assertEqual(
+                api_request.call_args_list[1].args[0],
+                "https://apihub.agnes-ai.com/agnesapi?"
+                "video_id=agnes-video-id&model_name=agnes-video-2.5",
+            )
+            download.assert_called_once_with(
+                "https://media.example.test/generated.mp4",
+                200 * 1024 * 1024,
+                media_type="视频",
+                timeout=120,
+            )
+            sleep.assert_called_once_with(2)
+
+    def test_media_skill_generates_and_returns_media_for_chat(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        media_path = Path("generated.png")
+        assistant_tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-image",
+                    "type": "function",
+                    "function": {
+                        "name": "send_image",
+                        "arguments": json.dumps({"prompt": "一只猫"}),
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                assistant_tool_call,
+                {"role": "assistant", "content": "图片已发送给老师。"},
+            ],
+        ) as complete_message, patch.object(
+            client, "generate_image", return_value=media_path
+        ) as generate_image, patch.object(
+            client, "_review_local_file_operation"
+        ) as review_file:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "请生成一只猫的图片"}]
+            )
+
+        self.assertEqual(reply, "图片已发送给老师。")
+        self.assertEqual(media, [media_path])
+        generate_image.assert_called_once_with("一只猫")
+        self.assertEqual(
+            review_file.call_args.args[:2],
+            ("send_image", {"prompt": "一只猫"}),
+        )
+        self.assertEqual(complete_message.call_count, 2)
+        self.assertEqual(
+            complete_message.call_args_list[0].kwargs["tool_choice"],
+            {
+                "type": "function",
+                "function": {"name": "send_image"},
+            },
+        )
+        self.assertIsNone(complete_message.call_args_list[1].kwargs["tool_choice"])
+        self.assertEqual(
+            [
+                tool["function"]["name"]
+                for tool in complete_message.call_args_list[0].kwargs["tools"]
+            ],
+            [
+                "send_local_media",
+                "send_web_image",
+                "send_image",
+                "send_video",
+                "control_qq_music",
+                "run_terminal_command",
+            ],
+        )
+        self.assertEqual(
+            complete_message.call_args_list[0].kwargs["tools"][2]["function"][
+                "name"
+            ],
+            "send_image",
+        )
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertEqual(tool_message["tool_call_id"], "call-image")
+        self.assertIn("generated.png", tool_message["content"])
+
+    def test_qq_music_skill_is_invoked_for_explicit_tool_call(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-qq-music",
+                            "function": {
+                                "name": "control_qq_music",
+                                "arguments": json.dumps(
+                                    {"action": "search", "query": "青花瓷"}
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "已在 QQ 音乐中搜索。"},
+            ],
+        ) as complete_message, patch(
+            "ai_client.invoke_qq_music_skill",
+            return_value='{"application":"QQ 音乐","action":"search"}',
+        ) as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "在 QQ 音乐搜索青花瓷"}]
+            )
+
+        self.assertEqual(reply, "已在 QQ 音乐中搜索。")
+        self.assertEqual(media, [])
+        invoke.assert_called_once_with({"action": "search", "query": "青花瓷"})
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("QQ 音乐", tool_message["content"])
+
+    def test_webpage_image_skill_returns_selected_image_for_chat(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        image_url = "https://example.test/cat.png"
+        media_path = Path("cat.png")
+        assistant_tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-web-image",
+                    "type": "function",
+                    "function": {
+                        "name": "send_web_image",
+                        "arguments": json.dumps({"url": image_url}),
+                    },
+                }
+            ],
+        }
+        webpage_images = [{"url": image_url, "alt": "一只猫"}]
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                assistant_tool_call,
+                {"role": "assistant", "content": "已把网页图片发给老师。"},
+            ],
+        ) as complete_message, patch.object(
+            client, "download_webpage_image", return_value=media_path
+        ) as download_image, patch.object(
+            client, "_review_local_file_operation"
+        ) as review_file:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "请发送网页图片"}],
+                webpage_images=webpage_images,
+            )
+
+        self.assertEqual(reply, "已把网页图片发给老师。")
+        self.assertEqual(media, [media_path])
+        download_image.assert_called_once_with(image_url, {image_url})
+        review_file.assert_called_once()
+        self.assertEqual(
+            complete_message.call_args_list[0].kwargs["tools"][1]["function"][
+                "name"
+            ],
+            "send_web_image",
+        )
+
+    def test_explicit_image_request_does_not_accept_unforced_text_reply(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        with patch.object(
+            client,
+            "_complete_message",
+            return_value={
+                "role": "assistant",
+                "content": "图片生成服务无法生成图片。",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "tool_choice"):
+                client.complete_with_media_skills(
+                    [{"role": "user", "content": "请生成一张猫的图片"}]
+                )
+
+    def test_explicit_image_requests_are_distinguished_from_questions(self) -> None:
+        self.assertTrue(
+            AIClient._explicit_image_generation_request(
+                [{"role": "user", "content": "请生成一只猫的图片"}]
+            )
+        )
+        self.assertTrue(
+            AIClient._explicit_image_generation_request(
+                [{"role": "user", "content": "帮我画一只猫"}]
+            )
+        )
+        self.assertFalse(
+            AIClient._explicit_image_generation_request(
+                [{"role": "user", "content": "为什么无法生成图片？"}]
+            )
+        )
+        self.assertFalse(
+            AIClient._explicit_image_generation_request(
+                [{"role": "user", "content": "如何生成图片？"}]
+            )
+        )
+
+    def test_complete_message_sends_forced_tool_choice(self) -> None:
+        tool_choice = {
+            "type": "function",
+            "function": {"name": "send_image"},
+        }
+        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True), patch(
+            "ai_client.urllib.request.urlopen",
+            return_value=FakeResponse(
+                {"choices": [{"message": {"role": "assistant", "content": None}}]}
+            ),
+        ) as open_request:
+            AIClient()._complete_message(
+                [{"role": "user", "content": "请生成一张猫的图片"}],
+                tools=[],
+                tool_choice=tool_choice,
+            )
+
+        request_payload = json.loads(open_request.call_args.args[0].data)
+        self.assertEqual(request_payload["tool_choice"], tool_choice)
+
+    def test_media_skill_does_not_invoke_unknown_tools(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-unknown",
+                            "function": {
+                                "name": "run_shell",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "我无法执行该操作。"},
+            ],
+        ) as complete_message, patch.object(
+            client, "generate_image"
+        ) as generate_image:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "你好"}]
+            )
+
+        self.assertEqual(reply, "我无法执行该操作。")
+        self.assertEqual(media, [])
+        generate_image.assert_not_called()
+        self.assertIsNone(
+            complete_message.call_args_list[0].kwargs["tool_choice"]
+        )
+
+    def test_terminal_command_is_reviewed_before_execution(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        terminal_call = {
+            "id": "call-terminal",
+            "type": "function",
+            "function": {
+                "name": "run_terminal_command",
+                "arguments": json.dumps(
+                    {"terminal": "powershell", "command": "Get-ChildItem"}
+                ),
+            },
+        }
+        messages = [{"role": "user", "content": "请列出项目目录"}]
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [terminal_call],
+                },
+                {"role": "assistant", "content": "项目目录已列出。"},
+            ],
+        ), patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ) as review, patch(
+            "ai_client.invoke_terminal_skill",
+            return_value='{"output":"README.md"}',
+        ) as invoke:
+            reply, media = client.complete_with_media_skills(messages)
+
+        self.assertEqual(reply, "项目目录已列出。")
+        self.assertEqual(media, [])
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[0].model, "review-model")
+        review_payload = json.loads(review.call_args.args[1][1]["content"])
+        self.assertEqual(
+            review_payload["proposed_operation"]["arguments"],
+            {"terminal": "powershell", "command": "Get-ChildItem"},
+        )
+        invoke.assert_called_once_with(
+            {"terminal": "powershell", "command": "Get-ChildItem"}
+        )
+
+    def test_denied_terminal_command_is_not_executed(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        terminal_call = {
+            "id": "call-terminal",
+            "function": {
+                "name": "run_terminal_command",
+                "arguments": '{"terminal":"cmd","command":"dir"}',
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [terminal_call],
+                },
+                {"role": "assistant", "content": "未获批准，未执行。"},
+            ],
+        ) as complete_message, patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"deny","reason":"未明确授权"}',
+        ), patch("ai_client.invoke_terminal_skill") as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "你好"}]
+            )
+
+        self.assertEqual(reply, "未获批准，未执行。")
+        self.assertEqual(media, [])
+        invoke.assert_not_called()
+        self.assertIn(
+            "未明确授权",
+            complete_message.call_args_list[1].args[0][-1]["content"],
+        )
+
+    def test_local_media_skill_uses_user_file_picker(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        local_paths = [Path("picked.png"), Path("picked.mp4")]
+        select_local_media = Mock(return_value=local_paths)
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-local",
+                            "type": "function",
+                            "function": {
+                                "name": "send_local_media",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "已把选中的媒体发送到聊天。"},
+            ],
+        ) as complete_message, patch.object(
+            client, "_review_local_file_operation"
+        ) as review_file:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "请发送本地图片"}],
+                local_media_selector=select_local_media,
+            )
+
+        self.assertEqual(reply, "已把选中的媒体发送到聊天。")
+        self.assertEqual(media, local_paths)
+        select_local_media.assert_called_once_with()
+        review_file.assert_called_once()
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertIn("picked.png", tool_message["content"])
+        self.assertIn("picked.mp4", tool_message["content"])
+
+    def test_file_access_review_fails_closed_without_reviewer_model(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "尚未配置文件访问审查模型"):
+            client._review_local_file_operation(
+                "send_local_media",
+                {},
+                [{"role": "user", "content": "请发送本地图片"}],
+            )
+        with self.assertRaisesRegex(RuntimeError, "尚未配置终端命令审查模型"):
+            client._review_terminal_command(
+                {"terminal": "cmd", "command": "dir"},
+                [{"role": "user", "content": "请列出项目目录"}],
+            )
+
+    def test_local_file_skill_is_not_run_without_approved_review(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        select_local_media = Mock(return_value=[Path("picked.png")])
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-local",
+                            "function": {
+                                "name": "send_local_media",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "未获批准，未读取文件。"},
+            ],
+        ) as complete_message:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "请发送本地图片"}],
+                local_media_selector=select_local_media,
+            )
+
+        self.assertEqual(reply, "未获批准，未读取文件。")
+        self.assertEqual(media, [])
+        select_local_media.assert_not_called()
+        self.assertIn(
+            "尚未配置文件访问审查模型",
+            complete_message.call_args_list[1].args[0][-1]["content"],
+        )
+
+    def test_file_access_review_uses_configured_model_and_requires_allow(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        with patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ) as complete:
+            client._review_local_file_operation(
+                "send_local_media",
+                {},
+                [{"role": "user", "content": "请发送本地图片"}],
+            )
+
+        reviewer = complete.call_args.args[0]
+        self.assertEqual(reviewer.model, "review-model")
+        review_payload = json.loads(complete.call_args.args[1][1]["content"])
+        self.assertEqual(review_payload["user_request"], "请发送本地图片")
+        self.assertEqual(
+            review_payload["proposed_operation"],
+            {
+                "skill": "send_local_media",
+                "effect": (
+                    "打开文件选择器让用户选择本地图片或视频，并读取用户选中的文件以在聊天中展示；"
+                    "不会搜索其他路径或上传文件。"
+                ),
+                "arguments": {},
+            },
+        )
+
+        with patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"deny","reason":"未授权"}',
+        ):
+            with self.assertRaisesRegex(RuntimeError, "未授权"):
+                client._review_local_file_operation(
+                    "send_local_media",
+                    {},
+                    [{"role": "user", "content": "你好"}],
+                )
+
+        with patch.object(
+            AIClient, "complete", autospec=True, return_value="not JSON"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "无效结果"):
+                client._review_local_file_operation(
+                    "send_local_media",
+                    {},
+                    [{"role": "user", "content": "请发送本地图片"}],
+                )
 
     def test_media_refusal_uses_first_matching_subagent(self) -> None:
         image_agent = {
@@ -207,9 +942,30 @@ class AIClientTests(unittest.TestCase):
                 "请总结 https://example.test/article。", []
             )
 
-        fetch_webpage.assert_called_once_with("https://example.test/article")
+        fetch_webpage.assert_called_once_with(
+            "https://example.test/article", include_images=True
+        )
         self.assertIn("网页正文", content)
         self.assertIn("不可信内容", content)
+
+    def test_create_user_content_returns_webpage_image_candidates(self) -> None:
+        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True), patch(
+            "ai_client.AIClient._fetch_webpage",
+            return_value=(
+                "网页正文",
+                [("https://example.test/cat.png", "一只猫")],
+            ),
+        ):
+            content, images = AIClient().create_user_content_with_webpage_images(
+                "请发送 https://example.test/article 中的猫图", []
+            )
+
+        self.assertIn("网页图片候选", content)
+        self.assertIn("一只猫", content)
+        self.assertEqual(
+            images,
+            [{"url": "https://example.test/cat.png", "alt": "一只猫"}],
+        )
 
     def test_create_user_content_limits_linked_webpages(self) -> None:
         urls = " ".join(f"https://example{i}.test/" for i in range(4))
@@ -252,6 +1008,73 @@ class AIClientTests(unittest.TestCase):
             content = AIClient._fetch_webpage("https://example.test/")
 
         self.assertEqual(content, "Hello world")
+
+    def test_webpage_fetch_extracts_image_urls_and_alt_text(self) -> None:
+        from email.message import Message
+
+        class FakeWebResponse(FakeResponse):
+            def __init__(self) -> None:
+                super().__init__({})
+                self.body = (
+                    b'<meta property="og:image" content="/cover.jpg">'
+                    b'<p>Hello</p><img src="/images/cat.png" alt="A cat">'
+                )
+                self.headers = Message()
+                self.headers["Content-Type"] = "text/html; charset=utf-8"
+
+            def read(self, _size: int = -1) -> bytes:
+                return self.body if _size < 0 else self.body[:_size]
+
+        opener = SimpleNamespace(open=lambda *_args, **_kwargs: FakeWebResponse())
+        with (
+            patch("ai_client._validate_public_web_url"),
+            patch("ai_client.urllib.request.build_opener", return_value=opener),
+        ):
+            page_text, images = AIClient._fetch_webpage(
+                "https://example.test/article", include_images=True
+            )
+
+        self.assertEqual(page_text, "Hello")
+        self.assertEqual(
+            images,
+            [
+                ("https://example.test/cover.jpg", ""),
+                ("https://example.test/images/cat.png", "A cat"),
+            ],
+        )
+
+    def test_download_webpage_image_only_accepts_listed_urls(self) -> None:
+        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True):
+            client = AIClient()
+        with patch.object(client, "_download_public_media") as download:
+            with self.assertRaisesRegex(ValueError, "列出"):
+                client.download_webpage_image(
+                    "https://example.test/other.png",
+                    {"https://example.test/cat.png"},
+                )
+        download.assert_not_called()
+
+    def test_download_webpage_image_saves_verified_image(self) -> None:
+        image_url = "https://example.test/cat.png"
+        image_data = b"\x89PNG\r\n\x1a\nimage-data"
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"PRANA_API_KEY": "test-key"}, clear=True
+        ), patch(
+            "ai_client.settings_store.settings_file_path",
+            return_value=Path(directory) / "settings.json",
+        ), patch.object(
+            AIClient,
+            "_download_public_media",
+            return_value=image_data,
+        ) as download:
+            image_path = AIClient().download_webpage_image(
+                image_url, {image_url}
+            )
+            self.assertEqual(image_path.suffix, ".png")
+            self.assertEqual(image_path.read_bytes(), image_data)
+            download.assert_called_once_with(
+                image_url, 10 * 1024 * 1024, media_type="网页图片"
+            )
 
     def test_fetch_webpage_prefers_meta_charset_over_generic_header(self) -> None:
         body = '<meta charset="gbk"><p>网页正文</p>'.encode("gbk")

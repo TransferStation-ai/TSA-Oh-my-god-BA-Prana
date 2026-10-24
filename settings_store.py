@@ -108,12 +108,24 @@ def load_settings() -> dict[str, object]:
                 raise ValueError("子代理 API Key 设置格式无效。")
             agent["api_key"] = _unprotect_api_key(encrypted_key)
             subagents.append(agent)
-        return {
+        settings = {
             "api_key": api_key,
             "base_url": base_url,
             "model": model,
             "subagents": subagents,
         }
+        for field in ("image_model", "video_model"):
+            value = contents.get(field)
+            if value is not None:
+                if not isinstance(value, str):
+                    raise ValueError("媒体生成模型设置格式无效。")
+                settings[field] = value
+        review_model = contents.get("review_model")
+        if review_model is not None:
+            if not isinstance(review_model, str):
+                raise ValueError("操作审查模型设置格式无效。")
+            settings["review_model"] = review_model
+        return settings
     except (
         OSError,
         UnicodeDecodeError,
@@ -130,6 +142,9 @@ def save_settings(
     base_url: str,
     model: str,
     subagents: list[dict[str, object]] | None = None,
+    image_model: str | None = None,
+    video_model: str | None = None,
+    review_model: str | None = None,
 ) -> None:
     path = settings_file_path()
     contents = {
@@ -141,6 +156,12 @@ def save_settings(
             for agent in (subagents or [])
         ],
     }
+    if image_model is not None:
+        contents["image_model"] = image_model
+    if video_model is not None:
+        contents["video_model"] = video_model
+    if review_model is not None:
+        contents["review_model"] = review_model
     temporary_path = path.with_suffix(".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

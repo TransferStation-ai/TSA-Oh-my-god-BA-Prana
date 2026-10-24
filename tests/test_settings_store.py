@@ -41,6 +41,9 @@ class SettingsStoreTests(unittest.TestCase):
                             "media_types": ["image"],
                         }
                     ],
+                    "image-model",
+                    "video-model",
+                    "review-model",
                 )
                 saved_text = path.read_text(encoding="utf-8")
                 settings = settings_store.load_settings()
@@ -53,6 +56,9 @@ class SettingsStoreTests(unittest.TestCase):
                 "api_key": "private-test-key",
                 "base_url": "https://example.test/v1",
                 "model": "test-model",
+                "image_model": "image-model",
+                "video_model": "video-model",
+                "review_model": "review-model",
                 "subagents": [
                     {
                         "name": "图片助手",
