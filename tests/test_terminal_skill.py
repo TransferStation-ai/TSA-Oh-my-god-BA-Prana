@@ -70,3 +70,48 @@ class TerminalSkillTests(unittest.TestCase):
                     {"terminal": "cmd", "command": "type large.txt"},
                     workspace_root=root,
                 )
+
+    def test_rejects_absolute_paths_outside_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            outside = Path(directory) / "outside.txt"
+            outside.write_text("secret", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "工作目录"):
+                invoke_terminal_skill(
+                    {"terminal": "cmd", "command": f'type "{outside}"'},
+                    workspace_root=root,
+                )
+
+    def test_allows_explicit_outside_workspace_paths_when_approved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            outside = Path(directory) / "outside.txt"
+            outside.write_text("approved secret", encoding="utf-8")
+            contents = invoke_terminal_skill(
+                {
+                    "terminal": "cmd",
+                    "command": f'type "{outside}"',
+                    "allow_outside_workspace": True,
+                },
+                workspace_root=root,
+            )
+        self.assertIn("approved secret", contents)
+
+    def test_allows_current_windows_desktop_path_expansion(self) -> None:
+        desktop_path = Path.home() / "Desktop"
+        if not desktop_path.exists():
+            self.skipTest("当前系统没有 Desktop 目录。")
+
+        listing = invoke_terminal_skill(
+            {"terminal": "cmd", "command": f'type "{desktop_path / "desktop.ini"}"', "allow_outside_workspace": True},
+            workspace_root=Path.home(),
+        )
+        self.assertIn('"terminal": "cmd"', listing)
+
+        dir_listing = invoke_terminal_skill(
+            {"terminal": "cmd", "command": "dir ~\\Desktop", "allow_outside_workspace": True},
+            workspace_root=Path.home(),
+        )
+        self.assertIn("desktop.ini", dir_listing)

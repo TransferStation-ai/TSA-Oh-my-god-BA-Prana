@@ -328,6 +328,9 @@ class AIClientTests(unittest.TestCase):
                 "send_video",
                 "control_qq_music",
                 "run_terminal_command",
+                "get_project_structure",
+                "search_workspace_files",
+                "read_git_repository",
             ],
         )
         self.assertEqual(
@@ -384,6 +387,110 @@ class AIClientTests(unittest.TestCase):
         tool_message = complete_message.call_args_list[1].args[0][-1]
         self.assertEqual(tool_message["role"], "tool")
         self.assertIn("QQ 音乐", tool_message["content"])
+
+    def test_chat_message_skill_sends_streamed_messages(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        sent_messages: list[str] = []
+        tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-chat",
+                    "function": {
+                        "name": "send_chat_message",
+                        "arguments": json.dumps({"message": "先说明一下。"}),
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                tool_call,
+                {"role": "assistant", "content": "完整回复"},
+            ],
+        ) as complete_message:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "解释一下"}],
+                message_sender=sent_messages.append,
+            )
+
+        self.assertEqual(reply, "完整回复")
+        self.assertEqual(media, [])
+        self.assertEqual(sent_messages, ["先说明一下。"])
+        tool_names = [
+            tool["function"]["name"]
+            for tool in complete_message.call_args_list[0].kwargs["tools"]
+        ]
+        self.assertIn("send_chat_message", tool_names)
+
+    def test_chat_message_skill_allows_empty_final_reply(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-chat",
+                    "function": {
+                        "name": "send_chat_message",
+                        "arguments": json.dumps({"message": "只有这一条。"}),
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                tool_call,
+                {"role": "assistant", "content": ""},
+            ],
+        ):
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "说一句话"}],
+                message_sender=lambda _message: None,
+            )
+
+        self.assertEqual(reply, "")
+        self.assertEqual(media, [])
+
+    def test_chat_message_skill_is_not_offered_without_sender(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        with patch.object(
+            client,
+            "_complete_message",
+            return_value={"role": "assistant", "content": "你好"},
+        ) as complete_message:
+            client.complete_with_media_skills(
+                [{"role": "user", "content": "你好"}]
+            )
+
+        tool_names = [
+            tool["function"]["name"]
+            for tool in complete_message.call_args.kwargs["tools"]
+        ]
+        self.assertNotIn("send_chat_message", tool_names)
 
     def test_webpage_image_skill_returns_selected_image_for_chat(self) -> None:
         client = AIClient(
@@ -641,6 +748,173 @@ class AIClientTests(unittest.TestCase):
             "未明确授权",
             complete_message.call_args_list[1].args[0][-1]["content"],
         )
+
+    def test_workspace_skill_is_reviewed_before_execution(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        arguments = {"mode": "content", "query": "Prana"}
+        workspace_call = {
+            "id": "call-workspace",
+            "type": "function",
+            "function": {
+                "name": "search_workspace_files",
+                "arguments": json.dumps(arguments),
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [workspace_call],
+                },
+                {"role": "assistant", "content": "搜索完成。"},
+            ],
+        ) as complete_message, patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ) as review, patch(
+            "ai_client.invoke_workspace_skill",
+            return_value='{"results":["main.py"]}',
+        ) as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "在项目里搜索 Prana"}]
+            )
+
+        self.assertEqual(reply, "搜索完成。")
+        self.assertEqual(media, [])
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[0].model, "review-model")
+        review_payload = json.loads(review.call_args.args[1][1]["content"])
+        self.assertEqual(
+            review_payload["proposed_operation"]["skill"],
+            "search_workspace_files",
+        )
+        self.assertEqual(
+            review_payload["proposed_operation"]["arguments"], arguments
+        )
+        invoke.assert_called_once_with("search_workspace_files", arguments)
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertIn("main.py", tool_message["content"])
+
+    def test_git_skill_is_reviewed_before_execution(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        arguments = {"action": "status"}
+        git_call = {
+            "id": "call-git",
+            "type": "function",
+            "function": {
+                "name": "read_git_repository",
+                "arguments": json.dumps(arguments),
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [git_call],
+                },
+                {"role": "assistant", "content": "Git 状态已读取。"},
+            ],
+        ) as complete_message, patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ), patch(
+            "ai_client.invoke_git_skill",
+            return_value='{"output":"M app.py"}',
+        ) as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "看看 Git 状态"}]
+            )
+
+        self.assertEqual(reply, "Git 状态已读取。")
+        self.assertEqual(media, [])
+        invoke.assert_called_once_with(arguments)
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertIn("M app.py", tool_message["content"])
+
+    def test_denied_workspace_skill_is_not_executed(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        workspace_call = {
+            "id": "call-workspace",
+            "function": {
+                "name": "get_project_structure",
+                "arguments": "{}",
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [workspace_call],
+                },
+                {"role": "assistant", "content": "未获批准，未读取项目。"},
+            ],
+        ) as complete_message, patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"deny","reason":"未明确授权"}',
+        ), patch("ai_client.invoke_workspace_skill") as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "你好"}]
+            )
+
+        self.assertEqual(reply, "未获批准，未读取项目。")
+        self.assertEqual(media, [])
+        invoke.assert_not_called()
+        self.assertIn(
+            "未明确授权",
+            complete_message.call_args_list[1].args[0][-1]["content"],
+        )
+
+    def test_workspace_review_fails_closed_without_reviewer_model(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "尚未配置工作区审查模型"):
+            client._review_workspace_operation(
+                "get_project_structure",
+                {},
+                [{"role": "user", "content": "看看项目结构"}],
+            )
 
     def test_local_media_skill_uses_user_file_picker(self) -> None:
         client = AIClient(

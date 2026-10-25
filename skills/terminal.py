@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -119,11 +120,50 @@ def validate_terminal_command(arguments: object) -> tuple[str, str]:
     return terminal, arguments["command"]
 
 
-def _workspace_path(
-    workspace_root: Path, path: str | None, *, allow_outside_workspace: bool = False
-) -> Path:
-    root = workspace_root.resolve()
-    candidate = root if path is None else (root / path).resolve()
+def _normalize_windows_path(path: str) -> str:
+    """Expand common Windows user-folder references used in desktop/file inspection."""
+    if not path:
+        return path
+    home_dir = Path.home().resolve()
+    user_profile = os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(home_dir)
+    expanded = os.path.expandvars(path)
+    expanded = expanded.replace("%USERPROFILE%", user_profile)
+    expanded = expanded.replace("%HOMEDRIVE%%HOMEPATH%", user_profile)
+    expanded = expanded.replace("%HOME%", user_profile)
+    expanded = os.path.expanduser(expanded)
+    if expanded.startswith("~"):
+        return expanded
+
+    if os.name == "nt":
+        normalized = os.path.normpath(expanded)
+        if normalized.startswith("\\\\") or normalized.startswith("//"):
+            return normalized
+        if re.match(r"^[A-Za-z]:", normalized):
+            return normalized
+        if normalized.startswith("~"):
+            return normalized
+        if normalized.lower() in {"desktop", "documents", "downloads", "music", "pictures", "videos"}:
+            return str((home_dir / normalized).resolve())
+    return expanded
+
+
+def _resolve_path_target(root: Path, path: str | None, *, allow_outside_workspace: bool) -> Path:
+    if path is None:
+        return root.resolve()
+
+    normalized = _normalize_windows_path(path)
+    if _looks_like_absolute_path(normalized):
+        if allow_outside_workspace:
+            return Path(normalized).resolve()
+        raise ValueError("终端命令只能访问应用工作目录内的路径。")
+
+    if normalized.lower() in {"desktop", "documents", "downloads", "music", "pictures", "videos"} and os.name == "nt":
+        candidate = (Path.home() / normalized).resolve()
+        if allow_outside_workspace:
+            return candidate
+        raise ValueError("终端命令只能访问应用工作目录内的路径。")
+
+    candidate = (root / normalized).resolve()
     if allow_outside_workspace:
         return candidate
     try:
@@ -131,6 +171,39 @@ def _workspace_path(
     except ValueError as error:
         raise ValueError("终端命令只能访问应用工作目录内的路径。") from error
     return candidate
+
+
+def _workspace_path(
+    workspace_root: Path, path: str | None, *, allow_outside_workspace: bool = False
+) -> Path:
+    root = workspace_root.resolve()
+    if path is None:
+        return root
+    return _resolve_path_target(root, path, allow_outside_workspace=allow_outside_workspace)
+
+
+def _looks_like_absolute_path(path: str) -> bool:
+    if not path:
+        return False
+    if path.startswith("\\\\") or path.startswith("//"):
+        return True
+    if re.match(r"^[A-Za-z]:", path):
+        return True
+    if path.startswith("~"):
+        return True
+    if path.startswith("%"):
+        return True
+    return Path(path).is_absolute()
+
+
+def _read_text_file(target: Path) -> str:
+    """Read UTF-8/UTF-16 Windows text files without assuming a single encoding."""
+    for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "cp1252"):
+        try:
+            return target.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return target.read_bytes().decode("utf-8", errors="replace")
 
 
 def invoke_terminal_skill(
@@ -166,7 +239,7 @@ def invoke_terminal_skill(
                 raise ValueError(
                     f"文件超过 {MAX_TERMINAL_FILE_BYTES // 1024} KB 读取限制。"
                 )
-            result = target.read_text(encoding="utf-8")
+            result = _read_text_file(target)
 
     if len(result) > MAX_TERMINAL_OUTPUT_LENGTH:
         result = result[:MAX_TERMINAL_OUTPUT_LENGTH] + "\n…输出已截断"
