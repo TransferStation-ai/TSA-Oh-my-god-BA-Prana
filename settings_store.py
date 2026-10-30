@@ -125,6 +125,31 @@ def load_settings() -> dict[str, object]:
             if not isinstance(review_model, str):
                 raise ValueError("操作审查模型设置格式无效。")
             settings["review_model"] = review_model
+        brainstorm_rounds = contents.get("brainstorm_rounds", 10)
+        if (
+            isinstance(brainstorm_rounds, bool)
+            or not isinstance(brainstorm_rounds, int)
+            or not 1 <= brainstorm_rounds <= 50
+        ):
+            raise ValueError("头脑风暴轮数设置无效。")
+        settings["brainstorm_rounds"] = brainstorm_rounds
+
+        raw_linked_providers = contents.get("linked_providers", [])
+        if not isinstance(raw_linked_providers, list):
+            raise ValueError("链接提供商设置格式无效。")
+        linked_providers: list[dict[str, object]] = []
+        for stored_provider in raw_linked_providers:
+            if not isinstance(stored_provider, dict):
+                raise ValueError("链接提供商设置格式无效。")
+            provider = dict(stored_provider)
+            encrypted_key = provider.get("api_key", "")
+            if not isinstance(encrypted_key, str):
+                raise ValueError("链接提供商 API Key 设置格式无效。")
+            provider["api_key"] = (
+                _unprotect_api_key(encrypted_key) if encrypted_key else ""
+            )
+            linked_providers.append(provider)
+        settings["linked_providers"] = linked_providers
         return settings
     except (
         OSError,
@@ -145,6 +170,8 @@ def save_settings(
     image_model: str | None = None,
     video_model: str | None = None,
     review_model: str | None = None,
+    brainstorm_rounds: int | None = None,
+    linked_providers: list[dict[str, object]] | None = None,
 ) -> None:
     path = settings_file_path()
     contents = {
@@ -162,6 +189,26 @@ def save_settings(
         contents["video_model"] = video_model
     if review_model is not None:
         contents["review_model"] = review_model
+    if brainstorm_rounds is not None:
+        if (
+            isinstance(brainstorm_rounds, bool)
+            or not isinstance(brainstorm_rounds, int)
+            or not 1 <= brainstorm_rounds <= 50
+        ):
+            raise ValueError("头脑风暴轮数设置无效。")
+        contents["brainstorm_rounds"] = brainstorm_rounds
+    if linked_providers is not None:
+        encrypted_providers: list[dict[str, object]] = []
+        for provider in linked_providers:
+            if not isinstance(provider, dict):
+                raise ValueError("链接提供商设置格式无效。")
+            stored = dict(provider)
+            key = stored.get("api_key", "")
+            if not isinstance(key, str):
+                raise ValueError("链接提供商 API Key 设置格式无效。")
+            stored["api_key"] = _protect_api_key(key) if key else ""
+            encrypted_providers.append(stored)
+        contents["linked_providers"] = encrypted_providers
     temporary_path = path.with_suffix(".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

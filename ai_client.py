@@ -17,6 +17,12 @@ import urllib.parse
 import urllib.request
 
 import settings_store
+from brainstorm import (
+    BRAINSTORM_TOOL,
+    BrainstormParticipant,
+    BrainstormRunner,
+    validate_brainstorm_arguments,
+)
 from skills import (
     CHAT_SKILLS,
     GIT_SKILLS,
@@ -44,7 +50,7 @@ MAX_VIDEO_FRAMES = 16
 MAX_FRAME_DIMENSION = 1024
 VIDEO_GENERATION_TIMEOUT_SECONDS = 15 * 60
 VIDEO_GENERATION_POLL_SECONDS = 5
-MAX_MEDIA_SKILL_ROUNDS = 5
+MAX_TOOL_ROUNDS = 20
 MAX_CHAT_REQUEST_ATTEMPTS = 2
 MAX_WEBPAGES = 3
 MAX_WEBPAGE_BYTES = 1024 * 1024
@@ -445,6 +451,19 @@ class AIClient:
         self.image_model = self.image_model.strip()
         self.video_model = self.video_model.strip()
         self.review_model = self.review_model.strip()
+        brainstorm_rounds = settings.get("brainstorm_rounds", 10)
+        if (
+            isinstance(brainstorm_rounds, bool)
+            or not isinstance(brainstorm_rounds, int)
+            or not 1 <= brainstorm_rounds <= 50
+        ):
+            raise ValueError("头脑风暴轮数设置无效。")
+        self.brainstorm_rounds = brainstorm_rounds
+        configured_providers = settings.get("linked_providers", [])
+        if not isinstance(configured_providers, list):
+            raise ValueError("链接提供商配置格式无效。")
+        self.linked_providers = configured_providers
+        self._validate_linked_providers(self.linked_providers)
         configured_subagents = settings.get("subagents", [])
         if not isinstance(configured_subagents, list):
             raise ValueError("子代理配置格式无效。")
@@ -474,6 +493,8 @@ class AIClient:
         image_model: str | None = None,
         video_model: str | None = None,
         review_model: str | None = None,
+        brainstorm_rounds: int | None = None,
+        linked_providers: list[dict[str, object]] | None = None,
     ) -> None:
         api_key = api_key.strip()
         base_url = base_url.strip().rstrip("/")
@@ -494,9 +515,34 @@ class AIClient:
 
         if subagents is None:
             subagents = self.subagents
+        brainstorm_rounds = (
+            self.brainstorm_rounds
+            if brainstorm_rounds is None
+            else brainstorm_rounds
+        )
+        linked_providers = (
+            self.linked_providers
+            if linked_providers is None
+            else linked_providers
+        )
+        if (
+            isinstance(brainstorm_rounds, bool)
+            or not isinstance(brainstorm_rounds, int)
+            or not 1 <= brainstorm_rounds <= 50
+        ):
+            raise ValueError("头脑风暴轮数必须在 1-50 之间。")
+        self._validate_linked_providers(linked_providers)
         self._validate_subagents(subagents)
         settings_store.save_settings(
-            api_key, base_url, model, subagents, image_model, video_model, review_model
+            api_key,
+            base_url,
+            model,
+            subagents,
+            image_model,
+            video_model,
+            review_model,
+            brainstorm_rounds=brainstorm_rounds,
+            linked_providers=linked_providers,
         )
         self.api_key = api_key
         self.base_url = base_url
@@ -505,6 +551,8 @@ class AIClient:
         self.video_model = video_model
         self.review_model = review_model
         self.subagents = subagents
+        self.brainstorm_rounds = brainstorm_rounds
+        self.linked_providers = linked_providers
 
     def generate_image(self, prompt: str) -> Path:
         prompt = prompt.strip()
@@ -524,9 +572,9 @@ class AIClient:
         try:
             result = payload["data"][0]
             encoded = result.get("b64_json")
-            if isinstance(encoded, str):
+            if isinstance(encoded, str) and encoded:
                 image_data = base64.b64decode(encoded, validate=True)
-            elif isinstance(result.get("url"), str):
+            elif isinstance(result.get("url"), str) and result["url"]:
                 image_data = self._download_public_media(
                     result["url"], MAX_GENERATED_IMAGE_BYTES
                 )
@@ -762,22 +810,209 @@ class AIClient:
             for field in ("name", "description", "api_key", "base_url", "model"):
                 if not isinstance(agent.get(field), str) or not agent[field].strip():
                     raise ValueError(f"子代理的“{field}”不能为空。")
-            media_types = agent.get("media_types")
-            if (
-                not isinstance(media_types, list)
-                or not media_types
-                or any(
-                    not isinstance(item, str) or item not in ("image", "video")
-                    for item in media_types
+            brainstorm = agent.get("brainstorm", True)
+            if not isinstance(brainstorm, bool):
+                raise ValueError("子代理的 brainstorm 必须是布尔值。")
+
+    @staticmethod
+    def _validate_linked_providers(
+        providers: list[dict[str, object]],
+    ) -> None:
+        for provider in providers:
+            if not isinstance(provider, dict):
+                raise ValueError("链接提供商配置格式无效。")
+            for field in ("id", "name", "source"):
+                value = provider.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"链接提供商的“{field}”不能为空。")
+            if provider["source"] not in {"opencode", "main"}:
+                raise ValueError("链接提供商来源无效。")
+            base_url = provider.get("base_url", "")
+            if not isinstance(base_url, str):
+                raise ValueError("链接提供商 API 地址格式无效。")
+            api_key = provider.get("api_key", "")
+            if not isinstance(api_key, str):
+                raise ValueError("链接提供商 API Key 格式无效。")
+            models = provider.get("models")
+            if not isinstance(models, list):
+                raise ValueError("链接提供商模型列表格式无效。")
+            seen: set[str] = set()
+            for model in models:
+                if not isinstance(model, dict):
+                    raise ValueError("链接提供商模型格式无效。")
+                model_id = model.get("id")
+                if not isinstance(model_id, str) or not model_id.strip():
+                    raise ValueError("链接提供商模型 id 不能为空。")
+                if model_id in seen:
+                    continue
+                seen.add(model_id)
+                name = model.get("name", model_id)
+                if not isinstance(name, str):
+                    raise ValueError("链接提供商模型名称格式无效。")
+                brainstorm = model.get("brainstorm", False)
+                if not isinstance(brainstorm, bool):
+                    raise ValueError(
+                        "链接提供商模型 brainstorm 必须是布尔值。"
+                    )
+
+    @property
+    def brainstorm_participants(
+        self,
+    ) -> list[BrainstormParticipant]:
+        participants = [
+            BrainstormParticipant(
+                kind="main",
+                name="Prana（主模型）",
+                role="主模型，负责提出议题并在讨论中给出自己的判断。",
+                api_key=self.api_key,
+                base_url=self.base_url,
+                model=self.model,
+            )
+        ]
+        seen = {participants[0].dedupe_key}
+        for agent in self.subagents:
+            if not isinstance(agent, dict):
+                continue
+            if agent.get("brainstorm", True) is False:
+                continue
+            participant = BrainstormParticipant(
+                kind="subagent",
+                name=str(agent.get("name", "")),
+                role=str(agent.get("description", "")),
+                api_key=str(agent.get("api_key", "")),
+                base_url=str(agent.get("base_url", "")),
+                model=str(agent.get("model", "")),
+            )
+            if not all(
+                value.strip()
+                for value in (
+                    participant.name,
+                    participant.role,
+                    participant.api_key,
+                    participant.base_url,
+                    participant.model,
                 )
             ):
-                raise ValueError("子代理必须至少支持图片或视频中的一种。")
+                continue
+            if participant.dedupe_key in seen:
+                continue
+            seen.add(participant.dedupe_key)
+            participants.append(participant)
+
+        for provider in self.linked_providers:
+            if not isinstance(provider, dict):
+                continue
+            source = provider.get("source")
+            if source == "main":
+                api_key = self.api_key
+                base_url = self.base_url
+            else:
+                api_key = str(provider.get("api_key", ""))
+                base_url = str(provider.get("base_url", ""))
+            if not api_key.strip() or not base_url.strip():
+                continue
+            provider_name = str(provider.get("name", ""))
+            models = provider.get("models")
+            if not isinstance(models, list):
+                continue
+            for model in models:
+                if not isinstance(model, dict):
+                    continue
+                if not model.get("brainstorm", False):
+                    continue
+                model_id = str(model.get("id", "")).strip()
+                if not model_id:
+                    continue
+                model_name = (
+                    str(model.get("name", model_id)).strip()
+                    or model_id
+                )
+                participant = BrainstormParticipant(
+                    kind="linked",
+                    name=f"{provider_name} / {model_name}",
+                    role=(
+                        f"来自 {provider_name} 的 {model_name}，"
+                        "请从该模型自身的视角参与讨论。"
+                    ),
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model_id,
+                )
+                if participant.dedupe_key in seen:
+                    continue
+                seen.add(participant.dedupe_key)
+                participants.append(participant)
+        return participants
+
+    @property
+    def has_brainstorm_participants(self) -> bool:
+        return len(self.brainstorm_participants) > 1
 
     @staticmethod
     def _is_media_refusal(reply: str) -> bool:
         if MEDIA_UNSUPPORTED_MARKER in reply:
             return True
         return any(pattern.search(reply) for pattern in MEDIA_REFUSAL_PATTERNS)
+
+    @staticmethod
+    def _probe_reply_is_affirmative(reply: str) -> bool:
+        text = reply.strip().lower()
+        negative_markers = (
+            "不支持",
+            "无法",
+            "不能",
+            "不可以",
+            "不行",
+            "没法",
+            "不是",
+            "不会",
+            "看不到",
+            "未能",
+            "否",
+        )
+        if any(marker in text for marker in negative_markers):
+            return False
+        if re.search(
+            r"\b(?:no|not|false|cannot|can't|unable|don't|do not)\b", text
+        ):
+            return False
+        if any(marker in text for marker in ("是", "支持", "可以", "能够", "能")):
+            return True
+        return re.search(r"\b(?:yes|true)\b", text) is not None
+
+    def _subagent_supports_media(
+        self,
+        agent: dict[str, object],
+        media_types: set[str],
+    ) -> bool:
+        probe_questions = {
+            "image": (
+                "这是一次能力探测。请如实回答：你是否能直接查看并分析图片？"
+                "只回答“是”或“否”，不要解释。"
+            ),
+            "video": (
+                "这是一次能力探测。请如实回答：你是否能直接查看并分析视频？"
+                "只回答“是”或“否”，不要解释。"
+            ),
+        }
+        for media_type in ("image", "video"):
+            if media_type not in media_types:
+                continue
+            subagent = AIClient(configuration=agent)
+            try:
+                reply = subagent.complete(
+                    [
+                        {
+                            "role": "user",
+                            "content": probe_questions[media_type],
+                        }
+                    ]
+                )
+            finally:
+                del subagent
+            if not self._probe_reply_is_affirmative(reply):
+                return False
+        return True
 
     def complete_with_media_fallback(
         self,
@@ -802,32 +1037,124 @@ class AIClient:
         if not self._is_media_refusal(reply):
             return reply
 
-        candidates = [
-            agent
-            for agent in self.subagents
-            if isinstance(agent, dict)
-            and media_types.intersection(agent.get("media_types", []))
-        ]
-        if not candidates:
+        if not self.subagents:
+            raise RuntimeError("主模型无法分析媒体，且没有配置子代理。")
+
+        probe_failures: list[str] = []
+        probed_agent = False
+        supported_agent: dict[str, object] | None = None
+        for agent in self.subagents:
+            if not isinstance(agent, dict):
+                probe_failures.append("未命名子代理：子代理配置格式无效。")
+                continue
+            try:
+                self._validate_subagents([agent])
+                is_supported = self._subagent_supports_media(
+                    agent, media_types
+                )
+            except (RuntimeError, ValueError, OSError) as error:
+                name = agent.get("name")
+                agent_name = (
+                    name.strip()
+                    if isinstance(name, str) and name.strip()
+                    else "未命名子代理"
+                )
+                probe_failures.append(f"{agent_name}：{error}")
+                continue
+            probed_agent = True
+            if is_supported:
+                supported_agent = agent
+                break
+
+        if supported_agent is None:
+            if probe_failures and not probed_agent:
+                details = "；".join(probe_failures)
+                raise RuntimeError(
+                    "主模型无法分析媒体，且子代理能力探测失败："
+                    f"{details}"
+                )
+            if probe_failures and probed_agent:
+                details = "；".join(probe_failures)
+                raise RuntimeError(
+                    "主模型无法分析媒体，且没有子代理确认支持本轮媒体类型。"
+                    f"部分子代理能力探测失败：{details}"
+                )
             raise RuntimeError(
-                "主模型无法分析媒体，且没有配置支持媒体类型的子代理。"
+                "主模型无法分析媒体，且没有子代理确认支持本轮媒体类型。"
             )
 
-        agent = candidates[0]
-        self._validate_subagents([agent])
         subagent_messages = [dict(message) for message in messages]
-        subagent_messages[0] = {
+        subagent_system_prompt = {
             "role": "system",
             "content": (
-                f"你是子代理“{agent['name']}”。{agent['description']} "
+                f"你是子代理“{supported_agent['name']}”。"
+                f"{supported_agent['description']} "
                 "请直接分析用户提供的图片或视频，并明确说明无法确定的内容。"
             ),
         }
-        subagent = AIClient(configuration=agent)
+        for index, message in enumerate(subagent_messages):
+            if message.get("role") == "system":
+                subagent_messages[index] = subagent_system_prompt
+                break
+        else:
+            subagent_messages.insert(0, subagent_system_prompt)
+        subagent = AIClient(configuration=supported_agent)
         try:
             return subagent.complete(subagent_messages)
         finally:
             del subagent
+
+    def fetch_main_provider_models(self) -> list[dict[str, str]]:
+        if self.configuration_error is not None:
+            raise RuntimeError(self.configuration_error)
+        request = urllib.request.Request(
+            f"{self.base_url}/models",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
+        try:
+            with self._open_authenticated_request(
+                request, timeout=30
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            raise self._http_error(error) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(
+                f"无法连接 AI 服务：{error.reason}"
+            ) from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "AI 服务返回了无法解析的模型列表。"
+            ) from error
+        items: object = payload
+        if isinstance(payload, dict):
+            items = payload.get("data")
+            if items is None:
+                items = payload.get("models")
+        if not isinstance(items, list):
+            raise RuntimeError("AI 服务返回的模型列表格式无效。")
+        models: list[dict[str, str]] = []
+        for item in items:
+            if isinstance(item, str):
+                model_id = item.strip()
+                name = model_id
+            elif isinstance(item, dict):
+                raw_id = item.get("id")
+                if not isinstance(raw_id, str):
+                    continue
+                model_id = raw_id.strip()
+                raw_name = item.get("name", model_id)
+                name = str(raw_name).strip() or model_id
+            else:
+                continue
+            if not model_id:
+                continue
+            models.append({"id": model_id, "name": name})
+            if len(models) >= 200:
+                break
+        if not models:
+            raise RuntimeError("AI 服务没有返回可用模型。")
+        return models
 
     def complete_with_media_skills(
         self,
@@ -837,6 +1164,7 @@ class AIClient:
         local_media_selector: Callable[[], list[Path]] | None = None,
         webpage_images: list[dict[str, str]] | None = None,
         message_sender: Callable[[str], None] | None = None,
+        brainstorm_runner: BrainstormRunner | None = None,
     ) -> tuple[str, list[Path]]:
         working_messages = [dict(message) for message in messages]
         if media_types:
@@ -866,7 +1194,12 @@ class AIClient:
             tool_list += CHAT_SKILLS
         if self._explicit_time_request(messages):
             tool_list += TIME_SKILLS
-        for round_index in range(MAX_MEDIA_SKILL_ROUNDS):
+        if (
+            brainstorm_runner is not None
+            and self.has_brainstorm_participants
+        ):
+            tool_list += [BRAINSTORM_TOOL]
+        for round_index in range(MAX_TOOL_ROUNDS):
             assistant_message = self._complete_message(
                 working_messages,
                 tools=tool_list,
@@ -984,6 +1317,39 @@ class AIClient:
                         )
                         result = invoke_git_skill(arguments)
                         media_paths = []
+                    elif function["name"] == "start_brainstorm":
+                        problem, focus = validate_brainstorm_arguments(
+                            arguments
+                        )
+                        if (
+                            brainstorm_runner is None
+                            or not self.has_brainstorm_participants
+                        ):
+                            result = json.dumps(
+                                {
+                                    "status": "unavailable",
+                                    "message": (
+                                        "未配置可用的头脑风暴参与者。"
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            )
+                        else:
+                            try:
+                                outcome = brainstorm_runner.run(
+                                    messages, problem, focus
+                                )
+                            except ValueError as error:
+                                result = json.dumps(
+                                    {
+                                        "status": "unavailable",
+                                        "message": str(error),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            else:
+                                result = outcome.as_tool_result()
+                        media_paths = []
                     else:
                         result, media_paths = invoke_media_skill(
                             self,
@@ -1006,7 +1372,7 @@ class AIClient:
                 )
 
         raise RuntimeError(
-            f"AI 连续调用工具超过 {MAX_MEDIA_SKILL_ROUNDS} 轮，已停止。"
+            f"AI 连续调用工具超过 {MAX_TOOL_ROUNDS} 轮，已停止。"
         )
 
     def _review_local_file_operation(

@@ -5,8 +5,9 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
-from tkinter import filedialog, font, messagebox
+from tkinter import filedialog, font, messagebox, simpledialog
 from typing import Callable
 import webbrowser
 
@@ -17,10 +18,14 @@ from ai_client import (
     MAX_VIDEO_BYTES,
     VIDEO_EXTENSIONS,
 )
-from chat_session import (
-    insert_assistant_messages,
-    split_message_segments,
-    trim_history,
+from brainstorm import BrainstormEvent, BrainstormRunner
+from chat_session import split_message_segments, trim_history
+import opencode_import
+from sessions import (
+    KIND_MAIN,
+    SessionStore,
+    build_session_title,
+    new_message,
 )
 
 
@@ -68,6 +73,8 @@ SYSTEM_PROMPT = (
     "可以调用 send_chat_message skill 发送中间消息，最后再用普通回复收尾；"
     "不要为了表演而拆分，也不要重复发送相同内容。"
     "老师明确要求查看当前时间、日期或时间戳时，调用 get_system_time skill。"
+    "当老师的问题复杂、需要多视角讨论或你希望先听取其他模型意见时，"
+    "可以调用 start_brainstorm；该能力会产生额外 API 费用，简单问题不要调用。"
 )
 
 BACKGROUND = "#171821"
@@ -85,11 +92,12 @@ STOPPED_MESSAGE = "（已停止生成）"
 @dataclass
 class ChatRequest:
     request_id: int
-    user_entry: dict[str, object]
+    session_id: str
+    user_message_id: str
     display_message: str
     attachment_paths: list[str]
-    sent_messages: list[str] = field(default_factory=list)
-    retried: bool = False
+    cleanup_children: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
 class PranaApp:
@@ -104,21 +112,25 @@ class PranaApp:
         self.message_images: list[tk.PhotoImage] = []
         self.welcome: tk.Frame | None = None
         self.ai_client = AIClient()
-        self.history: list[dict[str, object]] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
+        self.session_store = SessionStore()
+        self.active_session_id: str | None = None
+        self.active_session: dict[str, object] = {}
+        self.brainstorm_cards: dict[str, tk.StringVar] = {}
+        self.brainstorm_windows: dict[str, dict[str, object]] = {}
+        self.live_brainstorm_sessions: set[str] = set()
         self.attachment_paths: list[str] = []
         self.state_lock = threading.RLock()
         self.request_queue: queue.Queue[ChatRequest | None] = queue.Queue()
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self.pending_requests: dict[int, ChatRequest] = {}
+        self.active_request: ChatRequest | None = None
         self.next_request_id = 1
         self.closing = False
 
         self._build_header()
         self._build_chat()
         self._build_composer()
-        self._show_welcome()
+        self._load_initial_session()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(30, self._drain_ui_queue)
         self.worker = threading.Thread(target=self._request_worker, daemon=True)
@@ -196,6 +208,213 @@ class PranaApp:
         )
         self.settings_button.pack(side=tk.RIGHT, padx=(0, 8))
 
+        sessions_button = tk.Button(
+            header,
+            text="会话",
+            command=self._open_session_manager,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            activebackground="#373847",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=13,
+            pady=8,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+        )
+        sessions_button.pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _open_session_manager(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("会话")
+        dialog.configure(bg=BACKGROUND)
+        dialog.geometry("560x430")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        content = tk.Frame(dialog, bg=BACKGROUND, padx=18, pady=16)
+        content.pack(fill=tk.BOTH, expand=True)
+        session_list = tk.Listbox(
+            content,
+            bg="#292a36",
+            fg=TEXT,
+            selectbackground="#57516f",
+            relief=tk.FLAT,
+            borderwidth=0,
+            height=13,
+            font=("Segoe UI", 9),
+        )
+        session_list.pack(fill=tk.BOTH, expand=True)
+
+        status = tk.StringVar()
+        tk.Label(
+            content,
+            textvariable=status,
+            bg=BACKGROUND,
+            fg=MUTED,
+            wraplength=500,
+            justify=tk.LEFT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+        summaries: list[dict[str, object]] = []
+
+        def selected_index() -> int | None:
+            selection = session_list.curselection()
+            return int(selection[0]) if selection else None
+
+        def select_active() -> None:
+            for index, summary in enumerate(summaries):
+                if summary.get("id") == self.active_session_id:
+                    session_list.selection_clear(0, tk.END)
+                    session_list.selection_set(index)
+                    session_list.see(index)
+                    return
+
+        def refresh() -> None:
+            nonlocal summaries
+            summaries = self.session_store.list_sessions(kind=KIND_MAIN)
+            session_list.delete(0, tk.END)
+            for summary in summaries:
+                title = str(summary.get("title") or "新对话")
+                updated = time.strftime(
+                    "%m-%d %H:%M",
+                    time.localtime(
+                        float(summary.get("updated_at", 0))
+                    ),
+                )
+                session_list.insert(
+                    tk.END,
+                    f"{title}　{updated}　"
+                    f"{summary.get('message_count', 0)} 条",
+                )
+            if self.session_store.last_scan_errors:
+                status.set(
+                    f"{len(self.session_store.last_scan_errors)} "
+                    "个会话文件损坏，已跳过。"
+                )
+            else:
+                status.set("")
+            select_active()
+
+        def open_selected() -> None:
+            index = selected_index()
+            if index is None:
+                return
+            try:
+                self._open_session(str(summaries[index]["id"]))
+            except RuntimeError as error:
+                messagebox.showerror(
+                    "无法打开会话", str(error), parent=dialog
+                )
+                return
+            dialog.destroy()
+
+        def new_session() -> None:
+            self._create_session()
+            refresh()
+
+        def rename_selected() -> None:
+            index = selected_index()
+            if index is None:
+                return
+            summary = summaries[index]
+            new_title = simpledialog.askstring(
+                "重命名会话",
+                "会话标题：",
+                initialvalue=str(summary.get("title") or ""),
+                parent=dialog,
+            )
+            if new_title is None:
+                return
+            new_title = new_title.strip()[:60]
+            if not new_title:
+                return
+            try:
+                self.session_store.update(
+                    str(summary["id"]),
+                    lambda session: session.__setitem__(
+                        "title", new_title
+                    ),
+                )
+            except (RuntimeError, ValueError) as error:
+                messagebox.showerror(
+                    "无法重命名", str(error), parent=dialog
+                )
+                return
+            if summary.get("id") == self.active_session_id:
+                self._reload_active_session()
+            refresh()
+
+        def delete_selected() -> None:
+            index = selected_index()
+            if index is None:
+                return
+            summary = summaries[index]
+            if not messagebox.askyesno(
+                "删除会话",
+                "确定要删除该会话及其头脑风暴子会话吗？"
+                "此操作无法撤销。",
+                parent=dialog,
+            ):
+                return
+            self._cancel_session_requests(
+                str(summary["id"]), cleanup_children=True
+            )
+            try:
+                self.session_store.delete_tree(str(summary["id"]))
+            except (RuntimeError, ValueError) as error:
+                messagebox.showerror(
+                    "无法删除会话", str(error), parent=dialog
+                )
+                return
+            if summary.get("id") == self.active_session_id:
+                remaining = self.session_store.list_sessions(
+                    kind=KIND_MAIN
+                )
+                if remaining:
+                    self._open_session(str(remaining[0]["id"]))
+                else:
+                    self._create_session()
+            refresh()
+
+        controls = tk.Frame(content, bg=BACKGROUND)
+        controls.pack(fill=tk.X, pady=(10, 0))
+        for label, command in (
+            ("新建", new_session),
+            ("打开", open_selected),
+            ("重命名", rename_selected),
+            ("删除", delete_selected),
+        ):
+            tk.Button(
+                controls,
+                text=label,
+                command=command,
+                bg=ACCENT if label == "打开" else SURFACE_HOVER,
+                fg=BACKGROUND if label == "打开" else TEXT,
+                relief=tk.FLAT,
+                padx=12,
+                pady=6,
+            ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            controls,
+            text="关闭",
+            command=dialog.destroy,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        ).pack(side=tk.RIGHT)
+
+        session_list.bind(
+            "<Double-Button-1>",
+            lambda _event: open_selected(),
+        )
+        refresh()
+        self._center_window(dialog, self.root)
+
     def _open_settings(self) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title("API 设置")
@@ -204,6 +423,17 @@ class PranaApp:
         dialog.transient(self.root)
         dialog.grab_set()
         subagents = [dict(agent) for agent in self.ai_client.subagents]
+        linked_providers = [
+            {
+                **provider,
+                "models": [
+                    dict(model)
+                    for model in provider.get("models", [])
+                    if isinstance(model, dict)
+                ],
+            }
+            for provider in self.ai_client.linked_providers
+        ]
 
         content = tk.Frame(dialog, bg=BACKGROUND, padx=24, pady=20)
         content.pack(fill=tk.BOTH, expand=True)
@@ -218,6 +448,11 @@ class PranaApp:
             (
                 "操作审查模型（本地媒体、终端和工作区功能必填；共用主模型 API）",
                 self.ai_client.review_model,
+                False,
+            ),
+            (
+                "头脑风暴轮数（1-50，默认 10）",
+                str(self.ai_client.brainstorm_rounds),
                 False,
             ),
         ):
@@ -249,8 +484,12 @@ class PranaApp:
         image_model_entry = fields[3][1]
         video_model_entry = fields[4][1]
         review_model_entry = fields[5][1]
+        brainstorm_rounds_entry = fields[6][1]
 
         subagent_status = tk.StringVar(value=f"已配置 {len(subagents)} 个子代理")
+        linked_status = tk.StringVar(
+            value=f"已链接 {len(linked_providers)} 个提供商"
+        )
 
         def open_subagents() -> None:
             manager = tk.Toplevel(dialog)
@@ -264,7 +503,7 @@ class PranaApp:
             content.pack(fill=tk.BOTH, expand=True)
             tk.Label(
                 content,
-                text="主模型无法处理媒体时，将按配置顺序选择首个支持该媒体的子代理。",
+                text="主模型无法处理媒体时，会按配置顺序询问子代理是否支持该媒体，得到确认后再交给它分析。",
                 bg=BACKGROUND,
                 fg=MUTED,
                 wraplength=470,
@@ -286,145 +525,14 @@ class PranaApp:
             def refresh_agents() -> None:
                 agent_list.delete(0, tk.END)
                 for agent in subagents:
-                    media = "、".join(
-                        label
-                        for kind, label in (("image", "图片"), ("video", "视频"))
-                        if kind in agent["media_types"]
-                    )
                     agent_list.insert(
-                        tk.END, f"{agent['name']}（{media}）— {agent['model']}"
+                        tk.END, f"{agent['name']} — {agent['model']}"
                     )
 
             def edit_agent(index: int | None = None) -> None:
-                previous = dict(subagents[index]) if index is not None else None
-                editor = tk.Toplevel(manager)
-                editor.title("编辑子代理" if previous else "添加子代理")
-                editor.configure(bg=BACKGROUND)
-                editor.resizable(False, False)
-                editor.transient(manager)
-                editor.grab_set()
-                form = tk.Frame(editor, bg=BACKGROUND, padx=18, pady=14)
-                form.pack(fill=tk.BOTH, expand=True)
-                entries: dict[str, tk.Entry] = {}
-                initial = {
-                    "name": previous.get("name", "") if previous else "",
-                    "description": previous.get("description", "") if previous else "",
-                    "api_key": "",
-                    "base_url": (
-                        previous.get("base_url", self.ai_client.base_url)
-                        if previous
-                        else self.ai_client.base_url
-                    ),
-                    "model": previous.get("model", "") if previous else "",
-                }
-                labels = (
-                    ("name", "名称"),
-                    ("description", "职责/擅长领域"),
-                    ("api_key", "API Key（编辑时留空保持不变）"),
-                    ("base_url", "API 地址"),
-                    ("model", "模型名称"),
+                self._open_subagent_editor(
+                    manager, subagents, index, on_saved=refresh_agents
                 )
-                for key, label in labels:
-                    tk.Label(
-                        form,
-                        text=label,
-                        bg=BACKGROUND,
-                        fg=TEXT,
-                        font=("Segoe UI", 9),
-                    ).pack(anchor=tk.W, pady=(6, 3))
-                    entry = tk.Entry(
-                        form,
-                        bg="#292a36",
-                        fg=TEXT,
-                        insertbackground=TEXT,
-                        relief=tk.FLAT,
-                        borderwidth=0,
-                        show="*" if key == "api_key" else "",
-                        font=("Segoe UI", 9),
-                    )
-                    entry.pack(fill=tk.X, ipady=6)
-                    entry.insert(0, str(initial[key]))
-                    entries[key] = entry
-
-                prior_types = previous.get("media_types", []) if previous else []
-                supports_image = tk.BooleanVar(
-                    value=not previous or "image" in prior_types
-                )
-                supports_video = tk.BooleanVar(
-                    value=not previous or "video" in prior_types
-                )
-                checks = tk.Frame(form, bg=BACKGROUND)
-                checks.pack(anchor=tk.W, pady=(8, 2))
-                tk.Checkbutton(
-                    checks,
-                    text="支持图片",
-                    variable=supports_image,
-                    bg=BACKGROUND,
-                    fg=TEXT,
-                    selectcolor="#292a36",
-                    activebackground=BACKGROUND,
-                    activeforeground=TEXT,
-                ).pack(side=tk.LEFT)
-                tk.Checkbutton(
-                    checks,
-                    text="支持视频",
-                    variable=supports_video,
-                    bg=BACKGROUND,
-                    fg=TEXT,
-                    selectcolor="#292a36",
-                    activebackground=BACKGROUND,
-                    activeforeground=TEXT,
-                ).pack(side=tk.LEFT, padx=(10, 0))
-
-                def save_agent() -> None:
-                    agent = {key: entry.get().strip() for key, entry in entries.items()}
-                    if previous and not agent["api_key"]:
-                        agent["api_key"] = str(previous["api_key"])
-                    agent["media_types"] = [
-                        kind
-                        for kind, enabled in (
-                            ("image", supports_image.get()),
-                            ("video", supports_video.get()),
-                        )
-                        if enabled
-                    ]
-                    try:
-                        AIClient._validate_subagents([agent])
-                    except ValueError as error:
-                        messagebox.showerror(
-                            "配置无效", str(error), parent=editor
-                        )
-                        return
-                    if index is None:
-                        subagents.append(agent)
-                    else:
-                        subagents[index] = agent
-                    refresh_agents()
-                    editor.destroy()
-
-                buttons = tk.Frame(form, bg=BACKGROUND)
-                buttons.pack(fill=tk.X, pady=(12, 0))
-                tk.Button(
-                    buttons,
-                    text="取消",
-                    command=editor.destroy,
-                    bg=SURFACE_HOVER,
-                    fg=TEXT,
-                    relief=tk.FLAT,
-                    padx=12,
-                    pady=6,
-                ).pack(side=tk.RIGHT, padx=(8, 0))
-                tk.Button(
-                    buttons,
-                    text="保存子代理",
-                    command=save_agent,
-                    bg=ACCENT,
-                    fg=BACKGROUND,
-                    relief=tk.FLAT,
-                    padx=12,
-                    pady=6,
-                ).pack(side=tk.RIGHT)
-                self._center_window(editor, manager)
 
             def selected_index() -> int | None:
                 selection = agent_list.curselection()
@@ -500,8 +608,22 @@ class PranaApp:
             refresh_agents()
             self._center_window(manager, dialog)
 
+        def open_import() -> None:
+            self._open_opencode_import(
+                dialog,
+                api_key_entry,
+                base_url_entry,
+                model_entry,
+                subagents,
+                lambda: subagent_status.set(
+                    f"已配置 {len(subagents)} 个子代理"
+                ),
+            )
+
+        settings_tools = tk.Frame(content, bg=BACKGROUND)
+        settings_tools.pack(anchor=tk.W, pady=(12, 0))
         tk.Button(
-            content,
+            settings_tools,
             text="配置子代理",
             command=open_subagents,
             bg=SURFACE_HOVER,
@@ -514,7 +636,43 @@ class PranaApp:
             pady=7,
             cursor="hand2",
             font=("Segoe UI", 9),
-        ).pack(anchor=tk.W, pady=(12, 0))
+        ).pack(side=tk.LEFT)
+        tk.Button(
+            settings_tools,
+            text="管理链接提供商",
+            command=lambda: self._open_linked_providers(
+                dialog,
+                linked_providers,
+                lambda: linked_status.set(
+                    f"已链接 {len(linked_providers)} 个提供商"
+                ),
+            ),
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            activebackground="#373847",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=12,
+            pady=7,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(
+            settings_tools,
+            text="从 OpenCode 导入",
+            command=open_import,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            activebackground="#373847",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=12,
+            pady=7,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT, padx=(8, 0))
         tk.Label(
             content,
             textvariable=subagent_status,
@@ -522,10 +680,31 @@ class PranaApp:
             fg=MUTED,
             font=("Segoe UI", 9),
         ).pack(anchor=tk.W, pady=(5, 0))
+        tk.Label(
+            content,
+            textvariable=linked_status,
+            bg=BACKGROUND,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(3, 0))
 
         def save() -> None:
-            api_key = api_key_entry.get().strip() or self.ai_client.api_key
+            api_key = (
+                api_key_entry.get().strip()
+                or self.ai_client.api_key
+            )
             try:
+                rounds_text = brainstorm_rounds_entry.get().strip()
+                try:
+                    brainstorm_rounds = int(rounds_text)
+                except ValueError as error:
+                    raise ValueError(
+                        "头脑风暴轮数必须是整数。"
+                    ) from error
+                if not 1 <= brainstorm_rounds <= 50:
+                    raise ValueError(
+                        "头脑风暴轮数必须在 1-50 之间。"
+                    )
                 self.ai_client.save_configuration(
                     api_key,
                     base_url_entry.get(),
@@ -534,9 +713,13 @@ class PranaApp:
                     image_model_entry.get(),
                     video_model_entry.get(),
                     review_model_entry.get(),
+                    brainstorm_rounds=brainstorm_rounds,
+                    linked_providers=linked_providers,
                 )
             except (OSError, RuntimeError, ValueError) as error:
-                messagebox.showerror("保存失败", str(error), parent=dialog)
+                messagebox.showerror(
+                    "保存失败", str(error), parent=dialog
+                )
                 return
 
             self._update_pending_status()
@@ -577,6 +760,878 @@ class PranaApp:
         self._center_window(dialog, self.root)
         api_key_entry.focus_set()
 
+    def _open_subagent_editor(
+        self,
+        parent: tk.Toplevel,
+        subagents: list[dict[str, object]],
+        index: int | None = None,
+        *,
+        initial: dict[str, object] | None = None,
+        on_saved: Callable[[], None] | None = None,
+    ) -> None:
+        previous = dict(subagents[index]) if index is not None else None
+        source = initial if initial is not None else previous
+        editor = tk.Toplevel(parent)
+        editor.title("编辑子代理" if previous else "添加子代理")
+        editor.configure(bg=BACKGROUND)
+        editor.resizable(False, False)
+        editor.transient(parent)
+        editor.grab_set()
+        form = tk.Frame(editor, bg=BACKGROUND, padx=18, pady=14)
+        form.pack(fill=tk.BOTH, expand=True)
+        entries: dict[str, tk.Entry] = {}
+        initial_values = {
+            "name": str(source.get("name", "")) if source else "",
+            "description": (
+                str(source.get("description", "")) if source else ""
+            ),
+            "api_key": (
+                ""
+                if previous
+                else (str(source.get("api_key", "")) if source else "")
+            ),
+            "base_url": (
+                str(source.get("base_url", self.ai_client.base_url))
+                if source
+                else self.ai_client.base_url
+            ),
+            "model": str(source.get("model", "")) if source else "",
+        }
+        labels = (
+            ("name", "名称"),
+            ("description", "职责/擅长领域"),
+            ("api_key", "API Key（编辑时留空保持不变）"),
+            ("base_url", "API 地址"),
+            ("model", "模型名称"),
+        )
+        for key, label in labels:
+            tk.Label(
+                form,
+                text=label,
+                bg=BACKGROUND,
+                fg=TEXT,
+                font=("Segoe UI", 9),
+            ).pack(anchor=tk.W, pady=(6, 3))
+            entry = tk.Entry(
+                form,
+                bg="#292a36",
+                fg=TEXT,
+                insertbackground=TEXT,
+                relief=tk.FLAT,
+                borderwidth=0,
+                show="*" if key == "api_key" else "",
+                font=("Segoe UI", 9),
+            )
+            entry.pack(fill=tk.X, ipady=6)
+            entry.insert(0, initial_values[key])
+            entries[key] = entry
+
+        brainstorm_var = tk.BooleanVar(
+            value=(
+                bool(source.get("brainstorm", True))
+                if source
+                else True
+            )
+        )
+        tk.Checkbutton(
+            form,
+            text="参与头脑风暴",
+            variable=brainstorm_var,
+            bg=BACKGROUND,
+            fg=TEXT,
+            activebackground=BACKGROUND,
+            activeforeground=TEXT,
+            selectcolor="#292a36",
+            anchor=tk.W,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(6, 0))
+
+        def save_agent() -> None:
+            agent: dict[str, object] = {
+                key: entry.get().strip() for key, entry in entries.items()
+            }
+            agent["brainstorm"] = bool(brainstorm_var.get())
+            if previous and not agent["api_key"]:
+                agent["api_key"] = str(previous["api_key"])
+            try:
+                AIClient._validate_subagents([agent])
+            except ValueError as error:
+                messagebox.showerror("配置无效", str(error), parent=editor)
+                return
+            if index is None:
+                subagents.append(agent)
+            else:
+                subagents[index] = agent
+            if on_saved is not None:
+                on_saved()
+            editor.destroy()
+
+        buttons = tk.Frame(form, bg=BACKGROUND)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        tk.Button(
+            buttons,
+            text="取消",
+            command=editor.destroy,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        tk.Button(
+            buttons,
+            text="保存子代理",
+            command=save_agent,
+            bg=ACCENT,
+            fg=BACKGROUND,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        ).pack(side=tk.RIGHT)
+        self._center_window(editor, parent)
+
+    def _open_linked_providers(
+        self,
+        parent: tk.Toplevel,
+        linked_providers: list[dict[str, object]],
+        on_changed: Callable[[], None],
+    ) -> None:
+        dialog = tk.Toplevel(parent)
+        dialog.title("已链接提供商")
+        dialog.configure(bg=BACKGROUND)
+        dialog.geometry("760x520")
+        dialog.minsize(680, 440)
+        dialog.transient(parent)
+        dialog.grab_set()
+
+        content = tk.Frame(dialog, bg=BACKGROUND, padx=18, pady=16)
+        content.pack(fill=tk.BOTH, expand=True)
+        tk.Label(
+            content,
+            text=(
+                "勾选参与头脑风暴的模型。链接提供商的 API Key "
+                "会加密保存；缺少 Key 或地址的提供商不会参与讨论。"
+            ),
+            bg=BACKGROUND,
+            fg=MUTED,
+            wraplength=700,
+            justify=tk.LEFT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        lists = tk.Frame(content, bg=BACKGROUND)
+        lists.pack(fill=tk.BOTH, expand=True)
+
+        provider_frame = tk.Frame(lists, bg=BACKGROUND)
+        provider_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(
+            provider_frame,
+            text="提供商",
+            bg=BACKGROUND,
+            fg=TEXT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(0, 4))
+        provider_list = tk.Listbox(
+            provider_frame,
+            bg="#292a36",
+            fg=TEXT,
+            selectbackground="#57516f",
+            relief=tk.FLAT,
+            borderwidth=0,
+            height=12,
+            font=("Segoe UI", 9),
+            exportselection=False,
+        )
+        provider_list.pack(fill=tk.BOTH, expand=True)
+
+        model_frame = tk.Frame(lists, bg=BACKGROUND)
+        model_frame.pack(
+            side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0)
+        )
+        tk.Label(
+            model_frame,
+            text="模型（双击切换参与状态）",
+            bg=BACKGROUND,
+            fg=TEXT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(0, 4))
+        model_list = tk.Listbox(
+            model_frame,
+            bg="#292a36",
+            fg=TEXT,
+            selectbackground="#57516f",
+            relief=tk.FLAT,
+            borderwidth=0,
+            height=12,
+            font=("Segoe UI", 9),
+            exportselection=False,
+        )
+        model_list.pack(fill=tk.BOTH, expand=True)
+
+        hint = tk.StringVar()
+        tk.Label(
+            content,
+            textvariable=hint,
+            bg=BACKGROUND,
+            fg=MUTED,
+            wraplength=700,
+            justify=tk.LEFT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(8, 0))
+
+        current_provider: dict[str, object] | None = None
+
+        def selected_provider() -> dict[str, object] | None:
+            nonlocal current_provider
+            selection = provider_list.curselection()
+            if not selection:
+                current_provider = None
+                return None
+            current_provider = linked_providers[int(selection[0])]
+            return current_provider
+
+        def model_items() -> list[dict[str, object]]:
+            if current_provider is None:
+                return []
+            models = current_provider.get("models")
+            if not isinstance(models, list):
+                return []
+            return [
+                model for model in models if isinstance(model, dict)
+            ]
+
+        def refresh_models(_event: object = None) -> None:
+            provider = selected_provider()
+            model_list.delete(0, tk.END)
+            if provider is None:
+                hint.set("")
+                return
+            for model in model_items():
+                marker = (
+                    "✓" if model.get("brainstorm", False) else " "
+                )
+                model_list.insert(
+                    tk.END,
+                    f"[{marker}] "
+                    f"{model.get('name') or model.get('id')}",
+                )
+            notes: list[str] = []
+            if not str(provider.get("base_url", "")).strip():
+                notes.append("缺少 API 地址。")
+            if (
+                provider.get("source") != "main"
+                and not str(provider.get("api_key", "")).strip()
+            ):
+                notes.append("缺少 API Key。")
+            if provider.get("disabled"):
+                notes.append("该提供商在 OpenCode 中已禁用。")
+            if provider.get("source") == "opencode" and not provider.get(
+                "compatible", True
+            ):
+                notes.append(
+                    "该提供商可能不使用 OpenAI 兼容接口。"
+                )
+            hint.set(" ".join(notes))
+
+        def refresh_providers(select_index: int | None = None) -> None:
+            nonlocal current_provider
+            provider_list.delete(0, tk.END)
+            for provider in linked_providers:
+                models = provider.get("models")
+                count = len(models) if isinstance(models, list) else 0
+                provider_list.insert(
+                    tk.END,
+                    f"{provider.get('name')}（"
+                    f"{provider.get('source')}，"
+                    f"{count} 个模型）",
+                )
+            if linked_providers:
+                index = (
+                    0
+                    if select_index is None
+                    else min(select_index, len(linked_providers) - 1)
+                )
+                provider_list.selection_set(index)
+                provider_list.see(index)
+                refresh_models()
+            else:
+                current_provider = None
+                model_list.delete(0, tk.END)
+                hint.set("还没有链接提供商。")
+
+        def toggle_selected_model(_event: object = None) -> None:
+            provider = selected_provider()
+            selection = model_list.curselection()
+            if provider is None or not selection:
+                return
+            models = model_items()
+            index = int(selection[0])
+            if index >= len(models):
+                return
+            models[index]["brainstorm"] = not bool(
+                models[index].get("brainstorm", False)
+            )
+            refresh_models()
+            model_list.selection_set(index)
+            on_changed()
+
+        provider_list.bind("<<ListboxSelect>>", refresh_models)
+        model_list.bind(
+            "<Double-Button-1>", toggle_selected_model
+        )
+        model_list.bind("<space>", toggle_selected_model)
+
+        def link_opencode() -> None:
+            try:
+                providers = opencode_import.load_providers()
+            except (OSError, RuntimeError, ValueError) as error:
+                messagebox.showerror(
+                    "无法读取 OpenCode 配置",
+                    str(error),
+                    parent=dialog,
+                )
+                return
+            if not providers:
+                messagebox.showinfo(
+                    "没有可链接的提供商",
+                    "OpenCode 配置中没有可链接的提供商。",
+                    parent=dialog,
+                )
+                return
+
+            picker = tk.Toplevel(dialog)
+            picker.title("从 OpenCode 链接提供商")
+            picker.configure(bg=BACKGROUND)
+            picker.geometry("560x420")
+            picker.transient(dialog)
+            picker.grab_set()
+            picker_content = tk.Frame(
+                picker, bg=BACKGROUND, padx=16, pady=14
+            )
+            picker_content.pack(fill=tk.BOTH, expand=True)
+            picker_list = tk.Listbox(
+                picker_content,
+                bg="#292a36",
+                fg=TEXT,
+                selectbackground="#57516f",
+                relief=tk.FLAT,
+                borderwidth=0,
+                height=12,
+                font=("Segoe UI", 9),
+                exportselection=False,
+            )
+            picker_list.pack(fill=tk.BOTH, expand=True)
+            for provider in providers:
+                marker = (
+                    "（已禁用）"
+                    if provider.get("disabled")
+                    else ""
+                )
+                picker_list.insert(
+                    tk.END,
+                    f"{provider.get('name')}（"
+                    f"{provider.get('id')}）{marker}",
+                )
+
+            def add_selected() -> None:
+                selection = picker_list.curselection()
+                if not selection:
+                    return
+                converted = opencode_import.to_linked_provider(
+                    providers[int(selection[0])]
+                )
+                existing_index = next(
+                    (
+                        index
+                        for index, existing in enumerate(linked_providers)
+                        if existing.get("id") == converted["id"]
+                        and existing.get("source")
+                        == converted.get("source")
+                    ),
+                    None,
+                )
+                if existing_index is None:
+                    linked_providers.append(converted)
+                    index = len(linked_providers) - 1
+                else:
+                    linked_providers[existing_index] = (
+                        opencode_import.merge_linked_provider(
+                            linked_providers[existing_index], converted
+                        )
+                    )
+                    index = existing_index
+                picker.destroy()
+                refresh_providers(index)
+                on_changed()
+
+            picker_list.bind(
+                "<Double-Button-1>",
+                lambda _event: add_selected(),
+            )
+            picker_buttons = tk.Frame(
+                picker_content, bg=BACKGROUND
+            )
+            picker_buttons.pack(fill=tk.X, pady=(10, 0))
+            tk.Button(
+                picker_buttons,
+                text="取消",
+                command=picker.destroy,
+                bg=SURFACE_HOVER,
+                fg=TEXT,
+                relief=tk.FLAT,
+                padx=12,
+                pady=6,
+            ).pack(side=tk.RIGHT, padx=(8, 0))
+            tk.Button(
+                picker_buttons,
+                text="链接所选提供商",
+                command=add_selected,
+                bg=ACCENT,
+                fg=BACKGROUND,
+                relief=tk.FLAT,
+                padx=12,
+                pady=6,
+            ).pack(side=tk.RIGHT)
+            self._center_window(picker, dialog)
+
+        def fetch_main_models() -> None:
+            fetch_button.configure(state=tk.DISABLED)
+            hint.set("正在获取主模型提供商的模型列表…")
+            holder: dict[str, object] = {}
+
+            def work() -> None:
+                try:
+                    holder["models"] = (
+                        self.ai_client.fetch_main_provider_models()
+                    )
+                except (OSError, RuntimeError, ValueError) as error:
+                    holder["error"] = error
+
+            thread = threading.Thread(
+                target=work, daemon=True
+            )
+            thread.start()
+
+            def poll() -> None:
+                if not dialog.winfo_exists():
+                    return
+                if thread.is_alive():
+                    dialog.after(100, poll)
+                    return
+                fetch_button.configure(state=tk.NORMAL)
+                error = holder.get("error")
+                if isinstance(error, Exception):
+                    hint.set(str(error))
+                    return
+                models = holder.get("models")
+                if not isinstance(models, list):
+                    hint.set("没有获取到模型列表。")
+                    return
+                linked = next(
+                    (
+                        provider
+                        for provider in linked_providers
+                        if provider.get("id") == "main"
+                        and provider.get("source") == "main"
+                    ),
+                    None,
+                )
+                if linked is None:
+                    linked = {
+                        "id": "main",
+                        "name": "主模型提供商",
+                        "base_url": self.ai_client.base_url,
+                        "api_key": "",
+                        "source": "main",
+                        "models": [],
+                    }
+                    linked_providers.append(linked)
+                linked["base_url"] = self.ai_client.base_url
+                existing = {
+                    model.get("id"): model
+                    for model in linked.get("models", [])
+                    if isinstance(model, dict)
+                }
+                linked["models"] = [
+                    {
+                        "id": model["id"],
+                        "name": model.get("name", model["id"]),
+                        "brainstorm": bool(
+                            existing.get(
+                                model["id"], {}
+                            ).get("brainstorm", False)
+                        ),
+                    }
+                    for model in models
+                    if isinstance(model, dict)
+                    and isinstance(model.get("id"), str)
+                ]
+                try:
+                    index = linked_providers.index(linked)
+                except ValueError:
+                    index = len(linked_providers) - 1
+                refresh_providers(index)
+                on_changed()
+                hint.set(
+                    f"已获取 {len(linked['models'])} 个模型。"
+                )
+
+            dialog.after(100, poll)
+
+        def delete_provider() -> None:
+            provider = selected_provider()
+            if provider is None:
+                return
+            if not messagebox.askyesno(
+                "删除提供商",
+                f"确定要删除“{provider.get('name')}”吗？",
+                parent=dialog,
+            ):
+                return
+            linked_providers.remove(provider)
+            refresh_providers()
+            on_changed()
+
+        controls = tk.Frame(content, bg=BACKGROUND)
+        controls.pack(fill=tk.X, pady=(10, 0))
+        tk.Button(
+            controls,
+            text="从 OpenCode 链接",
+            command=link_opencode,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        ).pack(side=tk.LEFT)
+        fetch_button = tk.Button(
+            controls,
+            text="从主模型获取/刷新模型",
+            command=fetch_main_models,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        )
+        fetch_button.pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(
+            controls,
+            text="删除提供商",
+            command=delete_provider,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(
+            controls,
+            text="完成",
+            command=dialog.destroy,
+            bg=ACCENT,
+            fg=BACKGROUND,
+            relief=tk.FLAT,
+            padx=12,
+            pady=6,
+        ).pack(side=tk.RIGHT)
+
+        refresh_providers()
+        self._center_window(dialog, parent)
+
+    def _open_opencode_import(
+        self,
+        parent: tk.Toplevel,
+        api_key_entry: tk.Entry,
+        base_url_entry: tk.Entry,
+        model_entry: tk.Entry,
+        subagents: list[dict[str, object]],
+        on_subagents_changed: Callable[[], None],
+    ) -> None:
+        try:
+            providers = opencode_import.load_providers()
+        except (OSError, RuntimeError, ValueError) as error:
+            messagebox.showerror(
+                "无法读取 OpenCode 配置", str(error), parent=parent
+            )
+            return
+        if not providers:
+            messagebox.showinfo(
+                "没有可导入的提供商",
+                "OpenCode 配置中没有可导入的提供商。",
+                parent=parent,
+            )
+            return
+
+        dialog = tk.Toplevel(parent)
+        dialog.title("从 OpenCode 导入")
+        dialog.configure(bg=BACKGROUND)
+        dialog.geometry("760x560")
+        dialog.minsize(680, 480)
+        dialog.transient(parent)
+        dialog.grab_set()
+
+        content = tk.Frame(dialog, bg=BACKGROUND, padx=18, pady=16)
+        content.pack(fill=tk.BOTH, expand=True)
+        tk.Label(
+            content,
+            text=f"读取自：{opencode_import.config_file_path()}",
+            bg=BACKGROUND,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W)
+
+        lists = tk.Frame(content, bg=BACKGROUND)
+        lists.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        provider_frame = tk.Frame(lists, bg=BACKGROUND)
+        provider_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(
+            provider_frame,
+            text="提供商",
+            bg=BACKGROUND,
+            fg=TEXT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(0, 4))
+        provider_list = tk.Listbox(
+            provider_frame,
+            bg="#292a36",
+            fg=TEXT,
+            selectbackground="#57516f",
+            relief=tk.FLAT,
+            borderwidth=0,
+            height=10,
+            font=("Segoe UI", 9),
+        )
+        provider_list.pack(fill=tk.BOTH, expand=True)
+
+        model_frame = tk.Frame(lists, bg=BACKGROUND)
+        model_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        tk.Label(
+            model_frame,
+            text="模型",
+            bg=BACKGROUND,
+            fg=TEXT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(0, 4))
+        model_list = tk.Listbox(
+            model_frame,
+            bg="#292a36",
+            fg=TEXT,
+            selectbackground="#57516f",
+            relief=tk.FLAT,
+            borderwidth=0,
+            height=10,
+            font=("Segoe UI", 9),
+        )
+        model_list.pack(fill=tk.BOTH, expand=True)
+
+        api_key_var = tk.StringVar()
+        base_url_var = tk.StringVar()
+        model_var = tk.StringVar()
+        for label, variable, secret in (
+            ("API Key", api_key_var, True),
+            ("API 地址", base_url_var, False),
+            ("模型名称（可直接修改）", model_var, False),
+        ):
+            tk.Label(
+                content,
+                text=label,
+                bg=BACKGROUND,
+                fg=TEXT,
+                font=("Segoe UI", 9),
+            ).pack(anchor=tk.W, pady=(8, 3))
+            tk.Entry(
+                content,
+                textvariable=variable,
+                bg="#292a36",
+                fg=TEXT,
+                insertbackground=TEXT,
+                relief=tk.FLAT,
+                borderwidth=0,
+                show="*" if secret else "",
+                font=("Segoe UI", 10),
+            ).pack(fill=tk.X, ipady=7)
+
+        hint = tk.StringVar()
+        tk.Label(
+            content,
+            textvariable=hint,
+            bg=BACKGROUND,
+            fg=MUTED,
+            wraplength=700,
+            justify=tk.LEFT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(8, 0))
+
+        current_provider: dict[str, object] | None = None
+
+        def selected_models() -> list[dict[str, object]]:
+            if current_provider is None:
+                return []
+            models = current_provider.get("models")
+            if not isinstance(models, list):
+                return []
+            return [model for model in models if isinstance(model, dict)]
+
+        def select_model(_event: object = None) -> None:
+            selection = model_list.curselection()
+            if not selection:
+                return
+            models = selected_models()
+            index = int(selection[0])
+            if index < len(models):
+                model_var.set(str(models[index].get("id", "")))
+
+        def show_provider(_event: object = None) -> None:
+            nonlocal current_provider
+            selection = provider_list.curselection()
+            if not selection:
+                return
+            current_provider = providers[int(selection[0])]
+            model_list.delete(0, tk.END)
+            models = selected_models()
+            for model in models:
+                model_list.insert(
+                    tk.END,
+                    f"{model.get('name', '')} — {model.get('id', '')}",
+                )
+            api_key_var.set(str(current_provider.get("api_key", "")))
+            base_url_var.set(str(current_provider.get("base_url", "")))
+            if models:
+                model_list.selection_set(0)
+                select_model()
+            else:
+                model_var.set("")
+            notes: list[str] = []
+            if current_provider.get("disabled"):
+                notes.append("该提供商在 OpenCode 中已禁用。")
+            if not current_provider.get("compatible"):
+                notes.append(
+                    "该提供商可能不使用 OpenAI 兼容接口，导入后可能无法使用。"
+                )
+            if not str(current_provider.get("api_key", "")):
+                notes.append("未找到 API Key，请在下方填写。")
+            hint.set(" ".join(notes))
+
+        def close() -> None:
+            parent.grab_set()
+            dialog.destroy()
+
+        def fill_main() -> None:
+            base_url = base_url_var.get().strip()
+            model = model_var.get().strip()
+            if not base_url or not model:
+                messagebox.showerror(
+                    "无法导入",
+                    "API 地址和模型名称不能为空。",
+                    parent=dialog,
+                )
+                return
+            api_key = api_key_var.get().strip()
+            if api_key:
+                api_key_entry.delete(0, tk.END)
+                api_key_entry.insert(0, api_key)
+            base_url_entry.delete(0, tk.END)
+            base_url_entry.insert(0, base_url)
+            model_entry.delete(0, tk.END)
+            model_entry.insert(0, model)
+            close()
+
+        def add_subagent() -> None:
+            if current_provider is None:
+                messagebox.showerror(
+                    "未选择提供商", "请先选择 OpenCode 提供商。", parent=dialog
+                )
+                return
+            base_url = base_url_var.get().strip()
+            model = model_var.get().strip()
+            if not base_url or not model:
+                messagebox.showerror(
+                    "无法导入",
+                    "API 地址和模型名称不能为空。",
+                    parent=dialog,
+                )
+                return
+            provider_id = str(current_provider.get("id", ""))
+            self._open_subagent_editor(
+                dialog,
+                subagents,
+                initial={
+                    "name": str(
+                        current_provider.get("name", provider_id)
+                    ),
+                    "description": (
+                        f"来自 OpenCode 提供商 {provider_id} 的模型。"
+                    ),
+                    "api_key": api_key_var.get().strip(),
+                    "base_url": base_url,
+                    "model": model,
+                },
+                on_saved=on_subagents_changed,
+            )
+
+        for provider in providers:
+            marker = "（已禁用）" if provider.get("disabled") else ""
+            provider_list.insert(
+                tk.END,
+                f"{provider.get('name')}（{provider.get('id')}）{marker}",
+            )
+        provider_list.bind("<<ListboxSelect>>", show_provider)
+        model_list.bind("<<ListboxSelect>>", select_model)
+        provider_list.selection_set(0)
+        show_provider()
+
+        buttons = tk.Frame(content, bg=BACKGROUND)
+        buttons.pack(fill=tk.X, pady=(14, 0))
+        tk.Button(
+            buttons,
+            text="取消",
+            command=close,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            activebackground="#373847",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=14,
+            pady=7,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        tk.Button(
+            buttons,
+            text="添加为子代理…",
+            command=add_subagent,
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            activebackground="#373847",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=14,
+            pady=7,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+        tk.Button(
+            buttons,
+            text="填入主模型",
+            command=fill_main,
+            bg=ACCENT,
+            fg=BACKGROUND,
+            activebackground="#b9adff",
+            activeforeground=BACKGROUND,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=14,
+            pady=7,
+            cursor="hand2",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.RIGHT)
+        dialog.protocol("WM_DELETE_WINDOW", close)
+        self._center_window(dialog, parent)
+
     def _build_chat(self) -> None:
         chat = tk.Frame(self.root, bg=BACKGROUND)
         chat.pack(fill=tk.BOTH, expand=True, padx=24, pady=(18, 8))
@@ -606,6 +1661,872 @@ class PranaApp:
         )
         self.message_list.bind("<Configure>", self._update_scroll_region)
         self.canvas.bind("<Configure>", self._resize_messages)
+
+    def _load_initial_session(self) -> None:
+        try:
+            summaries = self.session_store.list_sessions(kind=KIND_MAIN)
+        except RuntimeError as error:
+            messagebox.showerror(
+                "会话读取失败", str(error), parent=self.root
+            )
+            summaries = []
+        if summaries:
+            try:
+                self._open_session(str(summaries[0]["id"]))
+                return
+            except RuntimeError as error:
+                messagebox.showerror(
+                    "会话读取失败", str(error), parent=self.root
+                )
+        session = self.session_store.new_session(
+            kind=KIND_MAIN, title="新对话"
+        )
+        self.session_store.save(session)
+        self._open_session(str(session["id"]))
+
+    def _open_session(self, session_id: str) -> None:
+        session = self.session_store.load(session_id)
+        self.active_session_id = session_id
+        self.active_session = session
+        self._render_active_session()
+        self._update_pending_status()
+
+    def _reload_active_session(self) -> None:
+        if self.active_session_id is None:
+            return
+        try:
+            self.active_session = self.session_store.load(
+                self.active_session_id
+            )
+        except RuntimeError:
+            return
+
+    def _create_session(self) -> dict[str, object]:
+        session = self.session_store.new_session(
+            kind=KIND_MAIN, title="新对话"
+        )
+        self.session_store.save(session)
+        self._open_session(str(session["id"]))
+        return session
+
+    def _render_active_session(self) -> None:
+        for child in self.message_list.winfo_children():
+            child.destroy()
+        self.message_text_labels.clear()
+        self.message_images.clear()
+        self.brainstorm_cards.clear()
+        self.welcome = None
+        stored = self.active_session.get("messages")
+        messages = stored if isinstance(stored, list) else []
+        visible = [
+            message
+            for message in messages
+            if isinstance(message, dict)
+            and message.get("visible", True)
+        ]
+        if not visible:
+            self._show_welcome()
+            return
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if not message.get("visible", True):
+                continue
+            self._add_message_from_record(message)
+        self.root.after_idle(
+            lambda: self.canvas.yview_moveto(1.0)
+        )
+
+    def _add_message_from_record(
+        self, message: dict[str, object]
+    ) -> None:
+        if message.get("kind") == "brainstorm":
+            self._add_brainstorm_card(message)
+            return
+        text = str(message.get("display") or "")
+        role = str(message.get("role", "assistant"))
+        media_paths = [
+            Path(path)
+            for path in message.get("media_paths", [])
+            if isinstance(path, str)
+        ]
+        error = message.get("error")
+        retry_id = message.get("retry_user_message_id")
+        message_id = message.get("id")
+        if isinstance(retry_id, str) and isinstance(message_id, str):
+            on_retry = lambda: self._retry_persisted_message(message_id)
+        else:
+            on_retry = None
+        self._add_message(
+            "user" if role == "user" else "assistant",
+            text,
+            is_error=isinstance(error, str),
+            is_muted=bool(message.get("muted")),
+            media_paths=media_paths,
+            on_retry=on_retry,
+        )
+
+    @staticmethod
+    def _brainstorm_topic_summary(display: object) -> str:
+        text = str(display or "").strip()
+        for prefix in ("头脑风暴：", "头脑风暴:"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                break
+        if not text or text == "头脑风暴":
+            text = "议题未记录"
+        if len(text) > 40:
+            text = text[:40] + "…"
+        return text
+
+    @staticmethod
+    def _brainstorm_metadata(
+        session: dict[str, object],
+    ) -> dict[str, object]:
+        metadata = session.get("brainstorm")
+        return metadata if isinstance(metadata, dict) else {}
+
+    @classmethod
+    def _brainstorm_participants(
+        cls, session: dict[str, object]
+    ) -> list[dict[str, object]]:
+        value = cls._brainstorm_metadata(session).get(
+            "participants", []
+        )
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, dict)]
+
+    @staticmethod
+    def _brainstorm_status_text(status: object) -> str:
+        labels = {
+            "idle": "待开始",
+            "running": "进行中",
+            "completed": "已完成",
+            "interrupted": "已停止",
+            "failed": "失败",
+        }
+        text = str(status or "")
+        return labels.get(text, text or "未知")
+
+    def _brainstorm_info_text(
+        self, session: dict[str, object]
+    ) -> str:
+        metadata = self._brainstorm_metadata(session)
+        rounds = metadata.get("rounds", 0)
+        participants = self._brainstorm_participants(session)
+        status_text = self._brainstorm_status_text(
+            session.get("status")
+        )
+        return (
+            f"共 {rounds} 轮 · 参与者 {len(participants)} 位"
+            f" · 状态：{status_text}"
+        )
+
+    def _brainstorm_participant_label(
+        self,
+        participant: dict[str, object],
+        parent_status: object = None,
+    ) -> str:
+        name = str(participant.get("name") or "参与者")
+        role = str(participant.get("role") or "").strip()
+        if len(role) > 12:
+            role = role[:12] + "…"
+        session_id = participant.get("session_id")
+        status_text = "不可用"
+        if isinstance(session_id, str) and session_id:
+            try:
+                participant_session = self.session_store.load(
+                    session_id
+                )
+            except (RuntimeError, ValueError):
+                status_text = "不可用"
+            else:
+                participant_status = participant_session.get("status")
+                if (
+                    participant_status == "running"
+                    and parent_status is not None
+                    and parent_status != "running"
+                ):
+                    if parent_status == "interrupted":
+                        status_text = "已停止（上次未完成）"
+                    else:
+                        status_text = self._brainstorm_status_text(
+                            parent_status
+                        )
+                else:
+                    status_text = self._brainstorm_status_text(
+                        participant_status
+                    )
+        parts = [name]
+        if role:
+            parts.append(role)
+        parts.append(status_text)
+        return " · ".join(parts)
+
+    def _load_brainstorm_session(
+        self, session_id: str
+    ) -> tuple[dict[str, object], bool]:
+        session = self.session_store.load(session_id)
+        if (
+            session.get("status") != "running"
+            or session_id in self.live_brainstorm_sessions
+        ):
+            return session, False
+
+        def mark_interrupted(current: dict[str, object]) -> None:
+            current["status"] = "interrupted"
+
+        try:
+            session = self.session_store.update(
+                session_id, mark_interrupted
+            )
+        except (RuntimeError, ValueError):
+            session["status"] = "interrupted"
+        self._interrupt_stale_brainstorm_participants(session)
+        return session, True
+
+    def _interrupt_stale_brainstorm_participants(
+        self, session: dict[str, object]
+    ) -> None:
+        def mark_interrupted(current: dict[str, object]) -> None:
+            current["status"] = "interrupted"
+
+        for participant in self._brainstorm_participants(session):
+            participant_session_id = participant.get("session_id")
+            if (
+                not isinstance(participant_session_id, str)
+                or not participant_session_id
+            ):
+                continue
+            try:
+                participant_session = self.session_store.load(
+                    participant_session_id
+                )
+            except (RuntimeError, ValueError):
+                continue
+            if participant_session.get("status") != "running":
+                continue
+            try:
+                self.session_store.update(
+                    participant_session_id, mark_interrupted
+                )
+            except (RuntimeError, ValueError):
+                continue
+
+    def _add_brainstorm_card(
+        self, message: dict[str, object]
+    ) -> None:
+        session_id = message.get("brainstorm_session_id")
+        card = tk.Frame(self.message_list, bg=BACKGROUND, pady=6)
+        card.pack(fill=tk.X)
+        bubble = tk.Frame(card, bg=SURFACE, padx=14, pady=10)
+        bubble.pack(side=tk.LEFT)
+        tk.Label(
+            bubble,
+            text="头脑风暴",
+            bg=SURFACE,
+            fg=TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor=tk.W)
+        tk.Label(
+            bubble,
+            text=self._brainstorm_topic_summary(
+                message.get("display")
+            ),
+            bg=SURFACE,
+            fg=MUTED,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=max(240, self.canvas.winfo_width() - 180),
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        info_var = tk.StringVar(value="参与者信息不可用")
+        tk.Label(
+            bubble,
+            textvariable=info_var,
+            bg=SURFACE,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(4, 0))
+
+        status_var = tk.StringVar(value="")
+        tk.Label(
+            bubble,
+            textvariable=status_var,
+            bg=SURFACE,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(4, 0))
+        record_button = tk.Button(
+            bubble,
+            text="查看记录",
+            command=lambda: self._open_brainstorm_window(
+                str(session_id)
+            ),
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            activebackground="#373847",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=12,
+            pady=5,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+        )
+        record_button.pack(anchor=tk.W, pady=(6, 0))
+
+        if not isinstance(session_id, str):
+            status_var.set("记录不可用")
+            record_button.configure(state=tk.DISABLED)
+            return
+        self.brainstorm_cards[session_id] = status_var
+        try:
+            session, stale = self._load_brainstorm_session(session_id)
+        except (RuntimeError, ValueError):
+            status_var.set("记录不可用")
+            record_button.configure(state=tk.DISABLED)
+            return
+        metadata = self._brainstorm_metadata(session)
+        participants = self._brainstorm_participants(session)
+        rounds = metadata.get("rounds", 0)
+        info_var.set(
+            f"参与者 {len(participants)} 位 · 共 {rounds} 轮"
+        )
+        self._update_brainstorm_card_status(
+            session_id, session, stale=stale
+        )
+
+        dots = ["", ".", "..", "..."]
+        animation = {"index": 0}
+
+        def tick() -> None:
+            if not bubble.winfo_exists():
+                return
+            if self.brainstorm_cards.get(session_id) is not status_var:
+                return
+            if session_id not in self.live_brainstorm_sessions:
+                return
+            current = status_var.get().rstrip(" .")
+            if not current.startswith("进行中"):
+                return
+            animation["index"] = (
+                animation["index"] + 1
+            ) % len(dots)
+            status_var.set(current + dots[animation["index"]])
+            bubble.after(600, tick)
+
+        if (
+            session.get("status") == "running"
+            and session_id in self.live_brainstorm_sessions
+        ):
+            bubble.after(600, tick)
+
+    def _update_brainstorm_card_status(
+        self,
+        session_id: str,
+        session: dict[str, object],
+        *,
+        stale: bool = False,
+    ) -> None:
+        status_var = self.brainstorm_cards.get(session_id)
+        if status_var is None:
+            return
+        if stale:
+            status_var.set("已停止（上次未完成）")
+            return
+        status_var.set(
+            self._brainstorm_status_text(session.get("status"))
+        )
+
+    def _handle_brainstorm_event(
+        self, request: ChatRequest, event: BrainstormEvent
+    ) -> None:
+        if event.type == "started":
+            self.live_brainstorm_sessions.add(
+                event.brainstorm_session_id
+            )
+        elif event.type in {"completed", "stopped", "failed"}:
+            self.live_brainstorm_sessions.discard(
+                event.brainstorm_session_id
+            )
+        if self.active_session_id == request.session_id:
+            status_var = self.brainstorm_cards.get(
+                event.brainstorm_session_id
+            )
+            if event.type == "started":
+                self._reload_active_session()
+                self._render_active_session()
+                status_var = self.brainstorm_cards.get(
+                    event.brainstorm_session_id
+                )
+            if status_var is not None:
+                if event.type in {"turn_started", "turn_finished"}:
+                    label = (
+                        f"进行中 第 {event.round}/{event.rounds} 轮"
+                    )
+                    if event.participant_name:
+                        label += f" · {event.participant_name}"
+                    status_var.set(label)
+                elif event.type == "summarizing":
+                    status_var.set("正在整理总结…")
+                elif event.type in {
+                    "completed",
+                    "stopped",
+                    "failed",
+                }:
+                    try:
+                        session = self.session_store.load(
+                            event.brainstorm_session_id
+                        )
+                    except (RuntimeError, ValueError):
+                        status_var.set("状态不可用")
+                    else:
+                        self._update_brainstorm_card_status(
+                            event.brainstorm_session_id, session
+                        )
+        state = self.brainstorm_windows.get(
+            event.brainstorm_session_id
+        )
+        if state is not None:
+            self._refresh_brainstorm_window(
+                event.brainstorm_session_id
+            )
+
+    def _open_brainstorm_window(self, session_id: str) -> None:
+        existing = self.brainstorm_windows.get(session_id)
+        if existing is not None:
+            window = existing.get("window")
+            if isinstance(window, tk.Toplevel) and window.winfo_exists():
+                window.lift()
+                return
+        try:
+            session, _stale = self._load_brainstorm_session(session_id)
+        except (RuntimeError, ValueError) as error:
+            messagebox.showerror(
+                "无法打开记录", str(error), parent=self.root
+            )
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("头脑风暴记录")
+        window.configure(bg=BACKGROUND)
+        window.geometry("860x620")
+        window.minsize(700, 480)
+
+        content = tk.Frame(window, bg=BACKGROUND, padx=16, pady=14)
+        content.pack(fill=tk.BOTH, expand=True)
+        metadata = self._brainstorm_metadata(session)
+        topic = str(metadata.get("topic", ""))
+        info_var = tk.StringVar(
+            value=self._brainstorm_info_text(session)
+        )
+        tk.Label(
+            content,
+            text=topic or "头脑风暴记录",
+            bg=BACKGROUND,
+            fg=TEXT,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=820,
+            font=("Segoe UI", 11, "bold"),
+        ).pack(fill=tk.X)
+        tk.Label(
+            content,
+            textvariable=info_var,
+            bg=BACKGROUND,
+            fg=MUTED,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=820,
+            font=("Segoe UI", 9),
+        ).pack(fill=tk.X, pady=(4, 0))
+
+        body = tk.Frame(content, bg=BACKGROUND)
+        body.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        left = tk.Frame(body, bg=BACKGROUND)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        tk.Label(
+            left,
+            text="参与者",
+            bg=BACKGROUND,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W)
+        participant_list = tk.Listbox(
+            left,
+            bg="#292a36",
+            fg=TEXT,
+            selectbackground="#57516f",
+            relief=tk.FLAT,
+            borderwidth=0,
+            width=24,
+            height=20,
+            font=("Segoe UI", 9),
+        )
+        participant_list.pack(fill=tk.Y, expand=True)
+
+        right = tk.Frame(body, bg=BACKGROUND)
+        right.pack(
+            side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0)
+        )
+        text = tk.Text(
+            right,
+            bg=CODE_BACKGROUND,
+            fg=CODE_TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            wrap=tk.WORD,
+            font=("Segoe UI", 9),
+        )
+        scrollbar = tk.Scrollbar(
+            right,
+            orient=tk.VERTICAL,
+            command=text.yview,
+            bg=SURFACE_HOVER,
+            troughcolor=BACKGROUND,
+            highlightthickness=0,
+            borderwidth=0,
+            relief=tk.FLAT,
+            width=10,
+        )
+        text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        text.configure(state=tk.DISABLED)
+
+        summary_var = tk.StringVar()
+        tk.Label(
+            content,
+            textvariable=summary_var,
+            bg=BACKGROUND,
+            fg=MUTED,
+            anchor=tk.W,
+            justify=tk.LEFT,
+            wraplength=820,
+            font=("Segoe UI", 9),
+        ).pack(fill=tk.X, pady=(10, 0))
+
+        participant_list.insert(tk.END, "合并时间线")
+        participants = self._brainstorm_participants(session)
+        session_ids: list[str | None] = [None]
+        for participant in participants:
+            participant_list.insert(
+                tk.END,
+                self._brainstorm_participant_label(
+                    participant, session.get("status")
+                ),
+            )
+            session_ids.append(
+                str(participant.get("session_id", ""))
+            )
+
+        state: dict[str, object] = {
+            "window": window,
+            "text": text,
+            "participant_list": participant_list,
+            "session_ids": session_ids,
+            "summary": summary_var,
+            "info": info_var,
+        }
+        self.brainstorm_windows[session_id] = state
+
+        def render(_event: object = None) -> None:
+            selection = participant_list.curselection()
+            index = int(selection[0]) if selection else 0
+            text.configure(state=tk.NORMAL)
+            try:
+                text.delete("1.0", tk.END)
+                try:
+                    current = self.session_store.load(session_id)
+                except (RuntimeError, ValueError):
+                    text.insert(tk.END, "记录不可用。")
+                    return
+                if index >= len(session_ids):
+                    index = 0
+                if index == 0:
+                    text.insert(
+                        tk.END,
+                        self._format_brainstorm_timeline(current),
+                    )
+                else:
+                    participant_session_id = session_ids[index]
+                    if (
+                        isinstance(participant_session_id, str)
+                        and participant_session_id
+                    ):
+                        try:
+                            participant_session = (
+                                self.session_store.load(
+                                    participant_session_id
+                                )
+                            )
+                        except (RuntimeError, ValueError):
+                            text.insert(tk.END, "子会话不可用。")
+                        else:
+                            text.insert(
+                                tk.END,
+                                self._format_participant_session(
+                                    participant_session
+                                ),
+                            )
+                    else:
+                        text.insert(tk.END, "子会话不可用。")
+                info_var.set(
+                    self._brainstorm_info_text(current)
+                )
+                metadata_now = self._brainstorm_metadata(current)
+                summary = str(metadata_now.get("summary") or "")
+                disagreements = metadata_now.get(
+                    "key_disagreements", []
+                )
+                summary_text = summary
+                if isinstance(disagreements, list) and disagreements:
+                    summary_text += (
+                        "\n关键分歧："
+                        + "；".join(
+                            str(item) for item in disagreements
+                        )
+                    )
+                summary_var.set(summary_text)
+            except (RuntimeError, ValueError):
+                text.delete("1.0", tk.END)
+                text.insert(tk.END, "记录不可用。")
+            finally:
+                text.configure(state=tk.DISABLED)
+
+        participant_list.bind("<<ListboxSelect>>", render)
+        participant_list.selection_set(0)
+        render()
+        window.protocol(
+            "WM_DELETE_WINDOW",
+            lambda: self._close_brainstorm_window(session_id),
+        )
+        self._center_window(window, self.root)
+
+    def _refresh_brainstorm_window(self, session_id: str) -> None:
+        state = self.brainstorm_windows.get(session_id)
+        if state is None:
+            return
+        window = state.get("window")
+        if not isinstance(window, tk.Toplevel) or not window.winfo_exists():
+            self.brainstorm_windows.pop(session_id, None)
+            return
+        participant_list = state.get("participant_list")
+        text = state.get("text")
+        if not isinstance(participant_list, tk.Listbox):
+            return
+        if not isinstance(text, tk.Text):
+            return
+        info_var = state.get("info")
+        summary_var = state.get("summary")
+        selection = participant_list.curselection()
+        index = int(selection[0]) if selection else 0
+        try:
+            current, _stale = self._load_brainstorm_session(session_id)
+        except (RuntimeError, ValueError):
+            if isinstance(info_var, tk.StringVar):
+                info_var.set("状态：不可用")
+            text.configure(state=tk.NORMAL)
+            try:
+                text.delete("1.0", tk.END)
+                text.insert(tk.END, "记录不可用。")
+            finally:
+                text.configure(state=tk.DISABLED)
+            return
+        participants = self._brainstorm_participants(current)
+        stored_session_ids = state.get("session_ids")
+        if isinstance(stored_session_ids, list):
+            session_ids: list[str | None] = stored_session_ids
+        else:
+            session_ids = [None]
+            state["session_ids"] = session_ids
+        session_ids[:] = [None]
+        participant_list.delete(0, tk.END)
+        participant_list.insert(tk.END, "合并时间线")
+        for participant in participants:
+            participant_list.insert(
+                tk.END,
+                self._brainstorm_participant_label(
+                    participant, current.get("status")
+                ),
+            )
+            session_ids.append(
+                str(participant.get("session_id", ""))
+            )
+        if index >= participant_list.size():
+            index = 0
+        participant_list.selection_clear(0, tk.END)
+        participant_list.selection_set(index)
+        if isinstance(info_var, tk.StringVar):
+            info_var.set(self._brainstorm_info_text(current))
+        text.configure(state=tk.NORMAL)
+        try:
+            text.delete("1.0", tk.END)
+            try:
+                if index == 0:
+                    text.insert(
+                        tk.END,
+                        self._format_brainstorm_timeline(current),
+                    )
+                else:
+                    participant_session_id = session_ids[index]
+                    if (
+                        isinstance(participant_session_id, str)
+                        and participant_session_id
+                    ):
+                        try:
+                            participant_session = (
+                                self.session_store.load(
+                                    participant_session_id
+                                )
+                            )
+                        except (RuntimeError, ValueError):
+                            text.insert(tk.END, "子会话不可用。")
+                        else:
+                            text.insert(
+                                tk.END,
+                                self._format_participant_session(
+                                    participant_session
+                                ),
+                            )
+                    else:
+                        text.insert(tk.END, "子会话不可用。")
+            except (RuntimeError, ValueError):
+                text.delete("1.0", tk.END)
+                text.insert(tk.END, "记录不可用。")
+        finally:
+            text.configure(state=tk.DISABLED)
+        if isinstance(summary_var, tk.StringVar):
+            metadata_now = self._brainstorm_metadata(current)
+            summary = str(metadata_now.get("summary") or "")
+            disagreements = metadata_now.get(
+                "key_disagreements", []
+            )
+            if isinstance(disagreements, list) and disagreements:
+                summary += "\n关键分歧：" + "；".join(
+                    str(item) for item in disagreements
+                )
+            summary_var.set(summary)
+
+    def _close_brainstorm_window(self, session_id: str) -> None:
+        state = self.brainstorm_windows.pop(session_id, None)
+        if state is None:
+            return
+        window = state.get("window")
+        if isinstance(window, tk.Toplevel) and window.winfo_exists():
+            window.destroy()
+
+    @staticmethod
+    def _format_brainstorm_timeline(
+        session: dict[str, object],
+    ) -> str:
+        messages = session.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        lines: list[str] = []
+        current_round: object = None
+        for turn in messages:
+            if not isinstance(turn, dict):
+                continue
+            round_number = turn.get("round")
+            if round_number != current_round:
+                current_round = round_number
+                if lines:
+                    lines.append("")
+                lines.append(f"—— 第 {round_number} 轮 ——")
+            name = str(turn.get("participant_name", ""))
+            kind = turn.get("kind")
+            if kind == "speak":
+                lines.append(f"{name}：{turn.get('content', '')}")
+            elif kind == "skip":
+                lines.append(f"{name}：（跳过）")
+            elif kind == "error":
+                lines.append(
+                    f"{name}：（失败：{turn.get('error', '')}）"
+                )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_participant_session(
+        session: dict[str, object],
+    ) -> str:
+        messages = session.get("messages")
+        if not isinstance(messages, list):
+            return ""
+        lines: list[str] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if not message.get("visible", True):
+                continue
+            role = message.get("role")
+            if role == "system":
+                continue
+            label = "讨论上下文" if role == "user" else "回复"
+            lines.append(
+                f"[{label}]\n{message.get('display') or ''}"
+            )
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _set_message_content(
+        session: dict[str, object],
+        message_id: str,
+        content: object,
+    ) -> None:
+        messages = session.get("messages")
+        if not isinstance(messages, list):
+            return
+        for message in messages:
+            if (
+                isinstance(message, dict)
+                and message.get("id") == message_id
+            ):
+                message["content"] = content
+                return
+
+    def _append_session_message(
+        self,
+        session_id: str,
+        message: dict[str, object],
+        *,
+        after_user_message_id: str | None = None,
+    ) -> None:
+        def append(session: dict[str, object]) -> None:
+            messages = session.get("messages")
+            if not isinstance(messages, list):
+                return
+            if after_user_message_id is None:
+                messages.append(message)
+                return
+            insert_at: int | None = None
+            for index, stored in enumerate(messages):
+                if (
+                    isinstance(stored, dict)
+                    and stored.get("id") == after_user_message_id
+                ):
+                    insert_at = index + 1
+                    while insert_at < len(messages):
+                        following = messages[insert_at]
+                        if not (
+                            isinstance(following, dict)
+                            and following.get("role") == "assistant"
+                        ):
+                            break
+                        insert_at += 1
+                    break
+            if insert_at is None:
+                messages.append(message)
+            else:
+                messages.insert(insert_at, message)
+
+        try:
+            self.session_store.update(session_id, append)
+        except (RuntimeError, ValueError):
+            return
 
     def _build_composer(self) -> None:
         composer = tk.Frame(self.root, bg=SURFACE, padx=18, pady=14)
@@ -782,7 +2703,8 @@ class PranaApp:
         if not self.ai_client.is_configured:
             self._add_message(
                 "assistant",
-                self.ai_client.configuration_error or "AI 服务配置无效。",
+                self.ai_client.configuration_error
+                or "AI 服务配置无效。",
                 is_error=True,
             )
             return
@@ -793,34 +2715,73 @@ class PranaApp:
                 path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
                 for path in attachment_paths
             )
-            display_message = f"{message}\n[附件：{filenames}]".strip()
+            display_message = (
+                f"{message}\n[附件：{filenames}]".strip()
+            )
 
         self.input.delete("1.0", tk.END)
         self._clear_attachments()
         if self.welcome is not None:
             self.welcome.destroy()
             self.welcome = None
+        if self.active_session_id is None:
+            self._create_session()
 
-        user_entry: dict[str, object] = {
-            "role": "user",
-            "content": display_message,
-        }
-        with self.state_lock:
-            self.history.append(user_entry)
+        user_record = new_message(
+            "user",
+            display_message,
+            display=display_message,
+            attachments=attachment_paths,
+        )
+
+        def mutate(session: dict[str, object]) -> None:
+            title = session.get("title")
+            if (
+                not isinstance(title, str)
+                or not title.strip()
+                or title == "新对话"
+            ):
+                session["title"] = build_session_title(
+                    message if message else "附件对话",
+                    fallback="附件对话",
+                )
+            messages = session.get("messages")
+            if isinstance(messages, list):
+                messages.append(user_record)
+
+        try:
+            self.active_session = self.session_store.update(
+                self.active_session_id, mutate
+            )
+        except (RuntimeError, ValueError) as error:
+            self._add_message(
+                "assistant",
+                f"无法保存消息：{error}",
+                is_error=True,
+            )
+            return
+
         self._add_message("user", display_message)
-        self._enqueue_request(user_entry, display_message, attachment_paths)
+        self._enqueue_request(
+            str(user_record["id"]),
+            display_message,
+            attachment_paths,
+        )
         self.input.focus_set()
 
     def _enqueue_request(
         self,
-        user_entry: dict[str, object],
+        user_message_id: str,
         display_message: str,
         attachment_paths: list[str],
     ) -> None:
+        if self.active_session_id is None:
+            return
         with self.state_lock:
             request = ChatRequest(
                 request_id=self.next_request_id,
-                user_entry=user_entry,
+                session_id=self.active_session_id,
+                user_message_id=user_message_id,
                 display_message=display_message,
                 attachment_paths=list(attachment_paths),
             )
@@ -830,21 +2791,33 @@ class PranaApp:
         self._update_pending_status()
 
     def _build_request_messages(
-        self, user_entry: dict[str, object]
+        self,
+        session: dict[str, object],
+        user_message_id: str,
     ) -> list[dict[str, object]]:
-        with self.state_lock:
-            index = next(
-                (
-                    position
-                    for position, message in enumerate(self.history)
-                    if message is user_entry
-                ),
-                None,
-            )
-            if index is None:
-                return []
-            snapshot = [dict(message) for message in self.history[: index + 1]]
-        return trim_history(snapshot)
+        messages: list[dict[str, object]] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+        found = False
+        stored = session.get("messages")
+        if isinstance(stored, list):
+            for message in stored:
+                if not isinstance(message, dict):
+                    continue
+                if not message.get("in_api", True):
+                    continue
+                role = message.get("role")
+                if role not in {"user", "assistant"}:
+                    continue
+                messages.append(
+                    {"role": role, "content": message.get("content")}
+                )
+                if message.get("id") == user_message_id:
+                    found = True
+                    break
+        if not found:
+            return []
+        return trim_history(messages)
 
     def _select_local_media(self) -> list[Path]:
         paths = filedialog.askopenfilenames(
@@ -909,28 +2882,71 @@ class PranaApp:
                     return
                 with self.state_lock:
                     active = request.request_id in self.pending_requests
-                if not active or self.closing:
-                    continue
-                self._process_request(request)
+                    if not active or self.closing:
+                        continue
+                    self.active_request = request
+                try:
+                    self._process_request(request)
+                finally:
+                    with self.state_lock:
+                        if self.active_request is request:
+                            self.active_request = None
             finally:
+                if (
+                    request is not None
+                    and request.cleanup_children
+                ):
+                    try:
+                        self.session_store.delete_children(
+                            request.session_id
+                        )
+                    except (RuntimeError, ValueError):
+                        pass
                 self.request_queue.task_done()
 
     def _process_request(self, request: ChatRequest) -> None:
-        messages = self._build_request_messages(request.user_entry)
+        try:
+            session = self.session_store.load(request.session_id)
+        except RuntimeError:
+            with self.state_lock:
+                self.pending_requests.pop(
+                    request.request_id, None
+                )
+            self._post_to_ui(self._update_pending_status)
+            return
+        messages = self._build_request_messages(
+            session, request.user_message_id
+        )
         if not messages:
             self._post_to_ui(
                 lambda: self._handle_reply(
-                    request, None, "找不到对应的用户消息。", None, []
+                    request,
+                    None,
+                    "找不到对应的用户消息。",
+                    None,
+                    [],
                 )
             )
             return
         try:
             user_content, webpage_images = (
                 self.ai_client.create_user_content_with_webpage_images(
-                    request.display_message, request.attachment_paths
+                    request.display_message,
+                    request.attachment_paths,
                 )
             )
             messages[-1]["content"] = user_content
+            try:
+                self.session_store.update(
+                    request.session_id,
+                    lambda current: self._set_message_content(
+                        current,
+                        request.user_message_id,
+                        user_content,
+                    ),
+                )
+            except (RuntimeError, ValueError):
+                pass
             media_types = {
                 kind
                 for attachment in request.attachment_paths
@@ -942,21 +2958,62 @@ class PranaApp:
             }
 
             def send_chat_message(text: str) -> None:
-                request.sent_messages.append(text)
+                with self.state_lock:
+                    if (
+                        request.request_id
+                        not in self.pending_requests
+                    ):
+                        return
+                    self._append_session_message(
+                        request.session_id,
+                        new_message(
+                            "assistant", text, display=text
+                        ),
+                        after_user_message_id=request.user_message_id,
+                    )
                 self._post_to_ui(
-                    lambda: self._show_streamed_message(request.request_id, text)
+                    lambda: self._show_streamed_message(
+                        request.request_id, text
+                    )
                 )
 
-            reply, generated_media = self.ai_client.complete_with_media_skills(
-                messages,
-                media_types,
-                local_media_selector=self._request_local_media_selection,
-                webpage_images=webpage_images,
-                message_sender=send_chat_message,
+            brainstorm_runner = None
+            if self.ai_client.has_brainstorm_participants:
+                brainstorm_runner = BrainstormRunner(
+                    store=self.session_store,
+                    parent_session_id=request.session_id,
+                    participants=(
+                        self.ai_client.brainstorm_participants
+                    ),
+                    rounds=self.ai_client.brainstorm_rounds,
+                    summarizer=self.ai_client,
+                    on_event=lambda event: self._post_to_ui(
+                        lambda: self._handle_brainstorm_event(
+                            request, event
+                        )
+                    ),
+                    should_stop=request.cancel_event.is_set,
+                )
+
+            reply, generated_media = (
+                self.ai_client.complete_with_media_skills(
+                    messages,
+                    media_types,
+                    local_media_selector=(
+                        self._request_local_media_selection
+                    ),
+                    webpage_images=webpage_images,
+                    message_sender=send_chat_message,
+                    brainstorm_runner=brainstorm_runner,
+                )
             )
             self._post_to_ui(
                 lambda: self._handle_reply(
-                    request, reply, None, user_content, generated_media
+                    request,
+                    reply,
+                    None,
+                    user_content,
+                    generated_media,
                 )
             )
         except Exception as error:
@@ -968,15 +3025,18 @@ class PranaApp:
                     return
             fallback_reply = None
             try:
-                fallback_reply = self.ai_client.complete_with_failure_fallback(
-                    messages,
-                    failure_reason=str(error),
+                fallback_reply = (
+                    self.ai_client.complete_with_failure_fallback(
+                        messages,
+                        failure_reason=str(error),
+                    )
                 )
             except Exception as fallback_error:
                 fallback_reply = None
                 error = fallback_error
             self._post_to_ui(
-                lambda fallback_reply=fallback_reply, error=error: self._handle_reply(
+                lambda fallback_reply=fallback_reply,
+                error=error: self._handle_reply(
                     request,
                     fallback_reply,
                     str(error) if fallback_reply is None else None,
@@ -1004,10 +3064,16 @@ class PranaApp:
             if not self.closing:
                 self.root.after(30, self._drain_ui_queue)
 
-    def _show_streamed_message(self, request_id: int, text: str) -> None:
+    def _show_streamed_message(
+        self, request_id: int, text: str
+    ) -> None:
         with self.state_lock:
-            if request_id not in self.pending_requests:
-                return
+            request = self.pending_requests.get(request_id)
+        if (
+            request is None
+            or self.active_session_id != request.session_id
+        ):
+            return
         self._add_message("assistant", text)
 
     def _handle_reply(
@@ -1019,74 +3085,231 @@ class PranaApp:
         generated_media: list[Path],
     ) -> None:
         with self.state_lock:
-            if self.pending_requests.pop(request.request_id, None) is None:
+            if self.pending_requests.pop(
+                request.request_id, None
+            ) is None:
                 return
         if self.closing:
             return
 
         if user_content is not None:
-            with self.state_lock:
-                request.user_entry["content"] = user_content
-        assistant_contents = list(request.sent_messages)
-        if error is None and reply is not None and reply.strip():
-            assistant_contents.append(reply)
-        with self.state_lock:
-            insert_assistant_messages(
-                self.history, request.user_entry, assistant_contents
-            )
+            try:
+                self.session_store.update(
+                    request.session_id,
+                    lambda session: self._set_message_content(
+                        session,
+                        request.user_message_id,
+                        user_content,
+                    ),
+                )
+            except (RuntimeError, ValueError):
+                pass
+
+        active = self.active_session_id == request.session_id
         if error is not None:
-            self._add_message(
+            record = new_message(
                 "assistant",
-                f"请求失败：{error}",
-                is_error=True,
-                on_retry=lambda: self._retry_request(request),
+                "",
+                display=f"请求失败：{error}",
+                error=str(error),
+                visible=True,
+                in_api=False,
+                retry_user_message_id=request.user_message_id,
             )
+            self._append_session_message(
+                request.session_id,
+                record,
+                after_user_message_id=request.user_message_id,
+            )
+            if active:
+                error_message_id = str(record["id"])
+                self._add_message(
+                    "assistant",
+                    f"请求失败：{error}",
+                    is_error=True,
+                    on_retry=lambda: self._retry_persisted_message(
+                        error_message_id
+                    ),
+                )
         elif reply is not None and reply.strip():
-            self._add_message("assistant", reply, media_paths=generated_media)
+            record = new_message(
+                "assistant",
+                reply,
+                display=reply,
+                media_paths=generated_media,
+            )
+            self._append_session_message(
+                request.session_id,
+                record,
+                after_user_message_id=request.user_message_id,
+            )
+            if active:
+                self._add_message(
+                    "assistant",
+                    reply,
+                    media_paths=generated_media,
+                )
         elif generated_media:
-            self._add_message("assistant", "", media_paths=generated_media)
+            record = new_message(
+                "assistant",
+                "",
+                display="",
+                media_paths=generated_media,
+                in_api=False,
+            )
+            self._append_session_message(
+                request.session_id,
+                record,
+                after_user_message_id=request.user_message_id,
+            )
+            if active:
+                self._add_message(
+                    "assistant", "", media_paths=generated_media
+                )
+        if active:
+            self._reload_active_session()
         self._update_pending_status()
 
-    def _retry_request(self, request: ChatRequest) -> None:
-        if request.retried:
+    def _retry_persisted_message(
+        self, error_message_id: str
+    ) -> None:
+        if self.active_session_id is None:
             return
-        request.retried = True
+        session_id = self.active_session_id
+        try:
+            session = self.session_store.load(session_id)
+        except RuntimeError:
+            return
+        messages = session.get("messages")
+        if not isinstance(messages, list):
+            return
+        error_message = next(
+            (
+                message
+                for message in messages
+                if isinstance(message, dict)
+                and message.get("id") == error_message_id
+            ),
+            None,
+        )
+        if error_message is None:
+            return
+        user_message_id = error_message.get("retry_user_message_id")
+        if not isinstance(user_message_id, str) or not user_message_id:
+            return
+        user_message = next(
+            (
+                message
+                for message in messages
+                if isinstance(message, dict)
+                and message.get("id") == user_message_id
+            ),
+            None,
+        )
+        if user_message is None:
+            return
         with self.state_lock:
-            exists = any(
-                message is request.user_entry for message in self.history
+            already_pending = any(
+                request.session_id == session_id
+                and request.user_message_id == user_message_id
+                for request in self.pending_requests.values()
             )
-        if not exists:
+        if already_pending:
             return
+
+        def clear_retry_marker(current: dict[str, object]) -> None:
+            stored = current.get("messages")
+            if not isinstance(stored, list):
+                return
+            for message in stored:
+                if (
+                    isinstance(message, dict)
+                    and message.get("id") == error_message_id
+                ):
+                    message["retry_user_message_id"] = None
+                    return
+
+        try:
+            self.session_store.update(session_id, clear_retry_marker)
+        except (RuntimeError, ValueError):
+            return
+        if self.active_session_id == session_id:
+            self._reload_active_session()
+            self._render_active_session()
         self._enqueue_request(
-            request.user_entry,
-            request.display_message,
-            request.attachment_paths,
+            user_message_id,
+            str(
+                user_message.get("display")
+                or user_message.get("content")
+                or ""
+            ),
+            list(user_message.get("attachments", [])),
         )
 
-    def _stop_generation(self) -> None:
+    def _session_requests(self, session_id: str) -> list[ChatRequest]:
         with self.state_lock:
-            pending = list(self.pending_requests.values())
-            self.pending_requests.clear()
-        while True:
-            try:
-                self.request_queue.get_nowait()
-            except queue.Empty:
-                break
-            else:
-                self.request_queue.task_done()
-        for request in pending:
-            with self.state_lock:
-                insert_assistant_messages(
-                    self.history,
-                    request.user_entry,
-                    list(request.sent_messages) + [STOPPED_MESSAGE],
+            requests = [
+                request
+                for request in self.pending_requests.values()
+                if request.session_id == session_id
+            ]
+            active = self.active_request
+            if (
+                active is not None
+                and active.session_id == session_id
+                and all(
+                    request.request_id != active.request_id
+                    for request in requests
                 )
-            self._add_message("assistant", STOPPED_MESSAGE, is_muted=True)
+            ):
+                requests.append(active)
+        return requests
+
+    def _cancel_session_requests(
+        self, session_id: str, *, cleanup_children: bool = False
+    ) -> list[ChatRequest]:
+        with self.state_lock:
+            requests = self._session_requests(session_id)
+            for request in requests:
+                self.pending_requests.pop(request.request_id, None)
+                request.cancel_event.set()
+                if cleanup_children:
+                    request.cleanup_children = True
+        return requests
+
+    def _stop_generation(self) -> None:
+        if self.active_session_id is None:
+            return
+        pending = self._cancel_session_requests(self.active_session_id)
+        for request in pending:
+            record = new_message(
+                "assistant",
+                STOPPED_MESSAGE,
+                display=STOPPED_MESSAGE,
+                muted=True,
+            )
+            self._append_session_message(
+                request.session_id,
+                record,
+                after_user_message_id=request.user_message_id,
+            )
+            if self.active_session_id == request.session_id:
+                self._add_message(
+                    "assistant",
+                    STOPPED_MESSAGE,
+                    is_muted=True,
+                )
+        if pending:
+            self._reload_active_session()
         self._update_pending_status()
 
     def _update_pending_status(self) -> None:
         with self.state_lock:
-            count = len(self.pending_requests)
+            count = sum(
+                1
+                for request in self.pending_requests.values()
+                if request.session_id == self.active_session_id
+            )
         if count:
             text = (
                 "普拉娜正在回复…"
@@ -1296,25 +3519,44 @@ class PranaApp:
             messagebox.showerror("无法打开媒体", str(error), parent=self.root)
 
     def _clear_chat(self) -> None:
-        with self.state_lock:
-            has_content = len(self.history) > 1 or bool(self.pending_requests)
+        if self.active_session_id is None:
+            return
+        pending = self._session_requests(self.active_session_id)
+        stored = self.active_session.get("messages")
+        has_content = bool(
+            isinstance(stored, list) and stored
+        ) or bool(pending)
         if has_content and not messagebox.askyesno(
             "清空对话",
             "确定要清空当前对话吗？此操作无法撤销。",
             parent=self.root,
         ):
             return
-        with self.state_lock:
-            self.pending_requests.clear()
-            self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
-        self._drain_request_queue()
-        self._update_pending_status()
+        self._cancel_session_requests(
+            self.active_session_id, cleanup_children=True
+        )
+        try:
+            self.session_store.delete_children(
+                self.active_session_id
+            )
+
+            def clear(session: dict[str, object]) -> None:
+                session["messages"] = []
+                session["title"] = "新对话"
+
+            self.active_session = self.session_store.update(
+                self.active_session_id, clear
+            )
+        except (RuntimeError, ValueError) as error:
+            self._add_message(
+                "assistant",
+                f"无法清空会话：{error}",
+                is_error=True,
+            )
+            return
         self._clear_attachments()
-        for child in self.message_list.winfo_children():
-            child.destroy()
-        self.message_text_labels.clear()
-        self.message_images.clear()
-        self._show_welcome()
+        self._render_active_session()
+        self._update_pending_status()
         self.input.delete("1.0", tk.END)
 
     def _drain_request_queue(self) -> None:
@@ -1334,6 +3576,10 @@ class PranaApp:
     def _on_close(self) -> None:
         self.closing = True
         with self.state_lock:
+            for request in self.pending_requests.values():
+                request.cancel_event.set()
+            if self.active_request is not None:
+                self.active_request.cancel_event.set()
             self.pending_requests.clear()
         self.request_queue.put(None)
         self.root.destroy()

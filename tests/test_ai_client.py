@@ -25,6 +25,24 @@ class FakeResponse:
         return self.body if _size < 0 else self.body[:_size]
 
 
+class FakeBrainstormRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def run(self, messages, problem, focus=""):
+        from brainstorm import BrainstormResult
+
+        self.calls.append((problem, focus))
+        return BrainstormResult(
+            status="completed",
+            brainstorm_session_id="a" * 32,
+            summary="总结",
+            key_disagreements=["分歧"],
+            rounds=1,
+            participants=["Prana（主模型）", "A"],
+        )
+
+
 class AIClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings_patch = patch(
@@ -114,11 +132,273 @@ class AIClientTests(unittest.TestCase):
             "gpt-image-1",
             "sora-2",
             "review-v1",
+            brainstorm_rounds=10,
+            linked_providers=[],
         )
         self.assertEqual(client.api_key, "new-key")
         self.assertEqual(client.base_url, "https://example.test/v1")
         self.assertEqual(client.model, "model-v2")
         self.assertEqual(client.review_model, "review-v1")
+        self.assertEqual(client.brainstorm_rounds, 10)
+        self.assertEqual(client.linked_providers, [])
+
+    def test_brainstorm_participants_order_and_dedupe(self) -> None:
+        client = AIClient(
+            configuration={
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "subagents": [
+                    {
+                        "name": "A",
+                        "description": "架构",
+                        "api_key": "a-key",
+                        "base_url": "https://a.test/v1",
+                        "model": "a-model",
+                    },
+                    {
+                        "name": "Duplicate",
+                        "description": "重复",
+                        "api_key": "x-key",
+                        "base_url": "https://main.test/v1",
+                        "model": "main-model",
+                    },
+                ],
+                "linked_providers": [
+                    {
+                        "id": "p1",
+                        "name": "P1",
+                        "base_url": "https://p1.test/v1",
+                        "api_key": "p1-key",
+                        "source": "opencode",
+                        "models": [
+                            {
+                                "id": "p1-model",
+                                "name": "P1M",
+                                "brainstorm": True,
+                            },
+                            {
+                                "id": "off",
+                                "name": "Off",
+                                "brainstorm": False,
+                            },
+                        ],
+                    },
+                    {
+                        "id": "main",
+                        "name": "Main",
+                        "base_url": "https://main.test/v1",
+                        "api_key": "",
+                        "source": "main",
+                        "models": [
+                            {
+                                "id": "main-model",
+                                "name": "Main",
+                                "brainstorm": True,
+                            },
+                            {
+                                "id": "other",
+                                "name": "Other",
+                                "brainstorm": True,
+                            },
+                        ],
+                    },
+                ],
+            }
+        )
+
+        names = [participant.name for participant in client.brainstorm_participants]
+
+        self.assertEqual(
+            names,
+            ["Prana（主模型）", "A", "P1 / P1M", "Main / Other"],
+        )
+        self.assertTrue(client.has_brainstorm_participants)
+
+    def test_brainstorm_requires_another_participant(self) -> None:
+        client = AIClient(
+            configuration={
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        self.assertFalse(client.has_brainstorm_participants)
+        self.assertEqual(
+            [participant.name for participant in client.brainstorm_participants],
+            ["Prana（主模型）"],
+        )
+
+    def test_fetch_main_provider_models(self) -> None:
+        client = AIClient(
+            configuration={
+                "api_key": "key",
+                "base_url": "https://example.test/v1",
+                "model": "m",
+            }
+        )
+        with patch.object(
+            client,
+            "_open_authenticated_request",
+            return_value=FakeResponse(
+                {"data": [{"id": "m1", "name": "M1"}, {"id": "m2"}]}
+            ),
+        ) as open_request:
+            models = client.fetch_main_provider_models()
+
+        self.assertEqual(
+            models,
+            [
+                {"id": "m1", "name": "M1"},
+                {"id": "m2", "name": "m2"},
+            ],
+        )
+        request = open_request.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/models"))
+        self.assertEqual(
+            request.get_header("Authorization"), "Bearer key"
+        )
+
+    def test_fetch_main_provider_models_rejects_empty_list(self) -> None:
+        client = AIClient(
+            configuration={
+                "api_key": "key",
+                "base_url": "https://example.test/v1",
+                "model": "m",
+            }
+        )
+        with patch.object(
+            client,
+            "_open_authenticated_request",
+            return_value=FakeResponse({"data": []}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "没有返回可用模型"):
+                client.fetch_main_provider_models()
+
+    def test_start_brainstorm_tool_is_available_and_returns_result(self) -> None:
+        client = AIClient(
+            configuration={
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "subagents": [
+                    {
+                        "name": "A",
+                        "description": "评审",
+                        "api_key": "a-key",
+                        "base_url": "https://a.test/v1",
+                        "model": "a-model",
+                    }
+                ],
+            }
+        )
+        runner = FakeBrainstormRunner()
+        tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "start_brainstorm",
+                        "arguments": json.dumps({"problem": "问题"}),
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                tool_call,
+                {"role": "assistant", "content": "最终回答"},
+            ],
+        ) as complete:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "请回答"}],
+                brainstorm_runner=runner,
+            )
+
+        self.assertEqual(reply, "最终回答")
+        self.assertEqual(media, [])
+        self.assertEqual(runner.calls, [("问题", "")])
+        first_tools = complete.call_args_list[0].kwargs["tools"]
+        self.assertTrue(
+            any(
+                tool["function"]["name"] == "start_brainstorm"
+                for tool in first_tools
+            )
+        )
+        second_messages = complete.call_args_list[1].args[0]
+        tool_messages = [
+            message
+            for message in second_messages
+            if message.get("role") == "tool"
+        ]
+        self.assertEqual(len(tool_messages), 1)
+        result = json.loads(tool_messages[0]["content"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["summary"], "总结")
+
+    def test_start_brainstorm_without_runner_returns_unavailable(self) -> None:
+        client = AIClient(
+            configuration={
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "subagents": [
+                    {
+                        "name": "A",
+                        "description": "评审",
+                        "api_key": "a-key",
+                        "base_url": "https://a.test/v1",
+                        "model": "a-model",
+                    }
+                ],
+            }
+        )
+        tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "start_brainstorm",
+                        "arguments": json.dumps({"problem": "问题"}),
+                    },
+                }
+            ],
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                tool_call,
+                {"role": "assistant", "content": "最终回答"},
+            ],
+        ) as complete:
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "请回答"}],
+                brainstorm_runner=None,
+            )
+
+        self.assertEqual(reply, "最终回答")
+        first_tools = complete.call_args_list[0].kwargs["tools"]
+        self.assertFalse(
+            any(
+                tool["function"]["name"] == "start_brainstorm"
+                for tool in first_tools
+            )
+        )
+        second_messages = complete.call_args_list[1].args[0]
+        tool_message = next(
+            message
+            for message in second_messages
+            if message.get("role") == "tool"
+        )
+        result = json.loads(tool_message["content"])
+        self.assertEqual(result["status"], "unavailable")
 
     def test_generate_image_saves_returned_png(self) -> None:
         png_data = b"\x89PNG\r\n\x1a\nimage-data"
@@ -153,6 +433,31 @@ class AIClientTests(unittest.TestCase):
                     "prompt": "一只猫",
                     "size": "1024x1024",
                 },
+            )
+
+    def test_generate_image_downloads_url_when_b64_json_is_empty(self) -> None:
+        png_data = b"\x89PNG\r\n\x1a\nimage-data"
+        image_url = "https://example.test/output/image.png"
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"PRANA_API_KEY": "test-key"}, clear=True
+        ), patch(
+            "ai_client.settings_store.settings_file_path",
+            return_value=Path(directory) / "settings.json",
+        ), patch(
+            "ai_client.AIClient._open_authenticated_request",
+            return_value=FakeResponse(
+                {"data": [{"url": image_url, "b64_json": ""}]}
+            ),
+        ), patch(
+            "ai_client.AIClient._download_public_media",
+            return_value=png_data,
+        ) as download:
+            client = AIClient()
+            image_path = client.generate_image("一只猫")
+            self.assertEqual(image_path.suffix, ".png")
+            self.assertEqual(image_path.read_bytes(), png_data)
+            download.assert_called_once_with(
+                image_url, 50 * 1024 * 1024
             )
 
     def test_generate_video_creates_polls_and_saves_video(self) -> None:
@@ -1085,55 +1390,104 @@ class AIClientTests(unittest.TestCase):
                     [{"role": "user", "content": "请发送本地图片"}],
                 )
 
-    def test_media_refusal_uses_first_matching_subagent(self) -> None:
-        image_agent = {
-            "name": "图像助手",
+    def test_media_fallback_probes_subagents_in_order_with_text_only(self) -> None:
+        first_agent: dict[str, object] = {
+            "name": "第一助手",
             "description": "分析图片",
-            "api_key": "image-key",
-            "base_url": "https://image.test/v1",
-            "model": "image-model",
-            "media_types": ["image"],
+            "api_key": "first-key",
+            "base_url": "https://first.test/v1",
+            "model": "first-model",
         }
-        video_agent = {
-            "name": "视频助手",
-            "description": "分析视频",
-            "api_key": "video-key",
-            "base_url": "https://video.test/v1",
-            "model": "video-model",
-            "media_types": ["video"],
+        second_agent: dict[str, object] = {
+            "name": "第二助手",
+            "description": "分析图片和视频",
+            "api_key": "second-key",
+            "base_url": "https://second.test/v1",
+            "model": "second-model",
         }
         client = AIClient(
             {
                 "api_key": "main-key",
                 "base_url": "https://main.test/v1",
                 "model": "main-model",
-                "subagents": [image_agent, video_agent],
+                "subagents": [first_agent, second_agent],
             }
         )
+        media_messages = [
+            {"role": "system", "content": "你是主模型"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "描述图片"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.test/cat.png"},
+                    },
+                ],
+            },
+        ]
+        probes: list[tuple[str, list[dict[str, object]]]] = []
+        delegations: list[tuple[str, list[dict[str, object]]]] = []
+
+        def fake_complete(instance, messages):
+            if instance.model == "main-model":
+                return "我无法识别图片内容。"
+            if len(messages) == 1 and isinstance(
+                messages[0].get("content"), str
+            ):
+                probes.append((instance.model, messages))
+                return "否" if instance.model == "first-model" else "是"
+            delegations.append((instance.model, messages))
+            return "第二助手已分析图片。"
+
         with patch(
             "ai_client.AIClient.complete",
             autospec=True,
-            side_effect=lambda instance, _messages: (
-                "无法识别图片"
-                if instance.model == "main-model"
-                else "图片内容已分析"
-            ),
+            side_effect=fake_complete,
         ) as complete:
             reply = client.complete_with_media_fallback(
-                [
-                    {"role": "system", "content": "system"},
-                    {"role": "user", "content": [{"type": "image_url"}]},
-                ],
-                {"image"},
+                media_messages, {"image"}
             )
 
-        self.assertEqual(reply, "图片内容已分析")
+        self.assertEqual(reply, "第二助手已分析图片。")
         self.assertEqual(
             [call.args[0].model for call in complete.call_args_list],
-            ["main-model", "image-model"],
+            ["main-model", "first-model", "second-model", "second-model"],
+        )
+        self.assertEqual(
+            [model for model, _messages in probes],
+            ["first-model", "second-model"],
+        )
+        for _model, probe_messages in probes:
+            self.assertEqual(len(probe_messages), 1)
+            self.assertIsInstance(probe_messages[0]["content"], str)
+            self.assertIn("能力探测", probe_messages[0]["content"])
+            self.assertNotIn(
+                "image_url",
+                json.dumps(probe_messages, ensure_ascii=False),
+            )
+            self.assertNotIn(
+                "https://example.test/cat.png",
+                json.dumps(probe_messages, ensure_ascii=False),
+            )
+        self.assertEqual(len(delegations), 1)
+        delegated_model, delegated_messages = delegations[0]
+        delegated_system = delegated_messages[0]["content"]
+        self.assertEqual(delegated_model, "second-model")
+        self.assertEqual(delegated_messages[0]["role"], "system")
+        self.assertIsInstance(delegated_system, str)
+        self.assertIn("第二助手", delegated_system)
+        self.assertIn(
+            "请直接分析用户提供的图片或视频，并明确说明无法确定的内容。",
+            delegated_system,
+        )
+        self.assertEqual(delegated_messages[1], media_messages[1])
+        self.assertIn(
+            "https://example.test/cat.png",
+            json.dumps(delegated_messages, ensure_ascii=False),
         )
 
-    def test_media_refusal_requires_a_matching_subagent(self) -> None:
+    def test_media_fallback_requires_configured_subagent(self) -> None:
         client = AIClient(
             {
                 "api_key": "main-key",
@@ -1145,10 +1499,126 @@ class AIClientTests(unittest.TestCase):
         with patch.object(
             AIClient, "complete", return_value="我无法识别视频内容。"
         ):
-            with self.assertRaisesRegex(RuntimeError, "没有配置"):
+            with self.assertRaisesRegex(RuntimeError, "没有配置子代理"):
                 client.complete_with_media_fallback(
                     [{"role": "user", "content": "总结视频"}], {"video"}
                 )
+
+    def test_media_fallback_reports_no_confirming_subagent(self) -> None:
+        agent: dict[str, object] = {
+            "name": "唯一助手",
+            "description": "分析图片",
+            "api_key": "agent-key",
+            "base_url": "https://agent.test/v1",
+            "model": "agent-model",
+        }
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "subagents": [agent],
+            }
+        )
+
+        def fake_complete(instance, _messages):
+            if instance.model == "main-model":
+                return "我无法识别图片内容。"
+            return "否"
+
+        with patch(
+            "ai_client.AIClient.complete",
+            autospec=True,
+            side_effect=fake_complete,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "没有子代理确认支持"
+            ):
+                client.complete_with_media_fallback(
+                    [
+                        {
+                            "role": "user",
+                            "content": [{"type": "image_url"}],
+                        }
+                    ],
+                    {"image"},
+                )
+
+    def test_media_fallback_reports_probe_failure(self) -> None:
+        agent: dict[str, object] = {
+            "name": "唯一助手",
+            "description": "分析图片",
+            "api_key": "agent-key",
+            "base_url": "https://agent.test/v1",
+            "model": "agent-model",
+        }
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "subagents": [agent],
+            }
+        )
+
+        def fake_complete(instance, _messages):
+            if instance.model == "main-model":
+                return "我无法识别图片内容。"
+            raise RuntimeError("探测连接失败")
+
+        with patch(
+            "ai_client.AIClient.complete",
+            autospec=True,
+            side_effect=fake_complete,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                client.complete_with_media_fallback(
+                    [
+                        {
+                            "role": "user",
+                            "content": [{"type": "image_url"}],
+                        }
+                    ],
+                    {"image"},
+                )
+
+        error_text = str(raised.exception)
+        self.assertIn("子代理能力探测失败", error_text)
+        self.assertIn("探测失败", error_text)
+        self.assertIn("唯一助手", error_text)
+        self.assertIn("探测连接失败", error_text)
+
+    def test_subagent_configuration_without_media_types_is_valid(self) -> None:
+        agent: dict[str, object] = {
+            "name": "无媒体类型助手",
+            "description": "按需探测媒体能力",
+            "api_key": "agent-key",
+            "base_url": "https://agent.test/v1",
+            "model": "agent-model",
+        }
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "subagents": [agent],
+            }
+        )
+
+        self.assertEqual(client.subagents, [agent])
+        AIClient._validate_subagents([agent])
+
+    def test_probe_reply_is_affirmative_conservatively(self) -> None:
+        self.assertTrue(AIClient._probe_reply_is_affirmative("是"))
+        self.assertTrue(AIClient._probe_reply_is_affirmative("支持"))
+        self.assertTrue(AIClient._probe_reply_is_affirmative("可以"))
+        self.assertFalse(AIClient._probe_reply_is_affirmative("否"))
+        self.assertFalse(AIClient._probe_reply_is_affirmative("不支持"))
+        self.assertFalse(AIClient._probe_reply_is_affirmative("无法查看图片"))
+        self.assertFalse(AIClient._probe_reply_is_affirmative("not sure"))
+        self.assertFalse(AIClient._probe_reply_is_affirmative("不确定"))
+        self.assertTrue(AIClient._probe_reply_is_affirmative("Yes, I know I can."))
+        self.assertTrue(AIClient._probe_reply_is_affirmative("Note: yes"))
 
     def test_media_fallback_is_not_used_for_regular_reply(self) -> None:
         client = AIClient(
