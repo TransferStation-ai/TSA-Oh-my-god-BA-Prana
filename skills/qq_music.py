@@ -6,6 +6,15 @@ import unicodedata
 from ctypes import wintypes
 from typing import Protocol
 
+from skills import win_input
+from skills.win_input import (
+    _HARDWAREINPUT,
+    _INPUT,
+    _INPUT_UNION,
+    _KEYBDINPUT,
+    _MOUSEINPUT,
+)
+
 
 QQ_MUSIC_SKILLS: list[dict[str, object]] = [
     {
@@ -175,48 +184,6 @@ def invoke_qq_music_skill(
         {"application": "QQ 音乐", "action": action, "result": result},
         ensure_ascii=False,
     )
-
-
-class _KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
-class _MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.c_size_t),
-    ]
-
-
-class _HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", wintypes.DWORD),
-        ("wParamL", wintypes.WORD),
-        ("wParamH", wintypes.WORD),
-    ]
-
-
-class _INPUT_UNION(ctypes.Union):
-    _fields_ = [
-        ("mi", _MOUSEINPUT),
-        ("ki", _KEYBDINPUT),
-        ("hi", _HARDWAREINPUT),
-    ]
-
-
-class _INPUT(ctypes.Structure):
-    _anonymous_ = ("data",)
-    _fields_ = [("type", wintypes.DWORD), ("data", _INPUT_UNION)]
 
 
 class _PROCESSENTRY32W(ctypes.Structure):
@@ -501,21 +468,7 @@ class _WindowsQQMusicController:
 
     @staticmethod
     def _ensure_dpi_awareness() -> None:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        try:
-            set_context = user32.SetProcessDpiAwarenessContext
-        except AttributeError:
-            try:
-                user32.SetProcessDPIAware()
-            except AttributeError:
-                pass
-            return
-        set_context.argtypes = [wintypes.HANDLE]
-        set_context.restype = wintypes.BOOL
-        try:
-            set_context(wintypes.HANDLE(-4))
-        except (ctypes.ArgumentError, OverflowError, OSError):
-            pass
+        win_input.ensure_dpi_awareness()
 
     @classmethod
     def _send_media_action(cls, action: str) -> str:
@@ -693,22 +646,7 @@ class _WindowsQQMusicController:
 
     @classmethod
     def _send_inputs(cls, inputs: list[_INPUT]) -> None:
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        send_input = user32.SendInput
-        send_input.argtypes = [
-            wintypes.UINT,
-            ctypes.POINTER(_INPUT),
-            ctypes.c_int,
-        ]
-        send_input.restype = wintypes.UINT
-        input_array = (_INPUT * len(inputs))(*inputs)
-        sent = send_input(len(inputs), input_array, ctypes.sizeof(_INPUT))
-        if sent != len(inputs):
-            error_code = ctypes.get_last_error()
-            raise RuntimeError(
-                f"QQ 音乐按键输入失败（Windows 错误 {error_code}，"
-                f"已发送 {sent}/{len(inputs)} 个事件）。"
-            )
+        win_input.send_inputs(inputs)
 
     @classmethod
     def _send_key(cls, key: int) -> None:
