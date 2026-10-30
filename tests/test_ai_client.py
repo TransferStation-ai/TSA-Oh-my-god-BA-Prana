@@ -43,6 +43,37 @@ class FakeBrainstormRunner:
         )
 
 
+class FakeDesktopAccess:
+    def __init__(
+        self,
+        *,
+        authorized: bool = False,
+        confirm: bool = True,
+        stop: bool = False,
+    ) -> None:
+        self.authorized = authorized
+        self.confirm = confirm
+        self.stop = stop
+        self.confirm_calls: list[tuple[str, str]] = []
+        self.grant_calls = 0
+
+    def is_authorized(self) -> bool:
+        return self.authorized
+
+    def confirm_authorization(
+        self, reason: str, planned_actions: str
+    ) -> bool:
+        self.confirm_calls.append((reason, planned_actions))
+        return self.confirm
+
+    def grant(self) -> None:
+        self.authorized = True
+        self.grant_calls += 1
+
+    def stop_requested(self) -> bool:
+        return self.stop
+
+
 class AIClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings_patch = patch(
@@ -632,6 +663,8 @@ class AIClientTests(unittest.TestCase):
                 "send_image",
                 "send_video",
                 "control_qq_music",
+                "request_desktop_control",
+                "control_desktop",
                 "run_terminal_command",
                 "get_project_structure",
                 "search_workspace_files",
@@ -1949,6 +1982,398 @@ class AIClientTests(unittest.TestCase):
         self.assertEqual(len(opened_paths), 2)
         self.assertFalse(Path(opened_paths[1]).exists())
         self.assertTrue(opened_paths[1].isascii())
+
+    @staticmethod
+    def _desktop_tool_call(
+        call_id: str, name: str, arguments: dict[str, object]
+    ) -> dict[str, object]:
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments),
+            },
+        }
+
+    def test_desktop_tools_are_offered(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        with patch.object(
+            client,
+            "_complete_message",
+            return_value={"role": "assistant", "content": "好"},
+        ) as complete_message:
+            client.complete_with_media_skills(
+                [{"role": "user", "content": "你好"}]
+            )
+        names = [
+            tool["function"]["name"]
+            for tool in complete_message.call_args.kwargs["tools"]
+        ]
+        self.assertIn("request_desktop_control", names)
+        self.assertIn("control_desktop", names)
+
+    def test_desktop_authorization_requires_user_and_review_approval(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        access = FakeDesktopAccess(confirm=True)
+        call = self._desktop_tool_call(
+            "call-auth",
+            "request_desktop_control",
+            {
+                "reason": "需要操作记事本",
+                "planned_actions": "激活记事本并输入文字",
+            },
+        )
+        messages = [{"role": "user", "content": "帮我在记事本里输入文字"}]
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "已获得授权。"},
+                ],
+            ) as complete_message,
+            patch.object(
+                AIClient,
+                "complete",
+                autospec=True,
+                return_value='{"decision":"allow","reason":"用户明确要求"}',
+            ) as review,
+        ):
+            reply, media = client.complete_with_media_skills(
+                messages, desktop_access=access
+            )
+
+        self.assertEqual(reply, "已获得授权。")
+        self.assertEqual(media, [])
+        self.assertEqual(
+            access.confirm_calls,
+            [("需要操作记事本", "激活记事本并输入文字")],
+        )
+        self.assertEqual(access.grant_calls, 1)
+        review.assert_called_once()
+        payload = json.loads(review.call_args.args[1][1]["content"])
+        self.assertEqual(
+            payload["proposed_operation"]["arguments"]["reason"],
+            "需要操作记事本",
+        )
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertIn("authorized", tool_message["content"])
+
+    def test_desktop_user_denial_skips_review(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        access = FakeDesktopAccess(confirm=False)
+        call = self._desktop_tool_call(
+            "call-auth",
+            "request_desktop_control",
+            {"reason": "需要操作桌面", "planned_actions": "点击窗口"},
+        )
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "已停止。"},
+                ],
+            ),
+            patch.object(AIClient, "complete") as review,
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "操作桌面"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(reply, "已停止。")
+        review.assert_not_called()
+        self.assertEqual(access.grant_calls, 0)
+
+    def test_desktop_review_denial_does_not_grant(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        access = FakeDesktopAccess(confirm=True)
+        call = self._desktop_tool_call(
+            "call-auth",
+            "request_desktop_control",
+            {"reason": "需要操作桌面", "planned_actions": "点击窗口"},
+        )
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "未获批准。"},
+                ],
+            ) as complete_message,
+            patch.object(
+                AIClient,
+                "complete",
+                autospec=True,
+                return_value='{"decision":"deny","reason":"计划越权"}',
+            ),
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "操作桌面"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(reply, "未获批准。")
+        self.assertEqual(access.grant_calls, 0)
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertIn("计划越权", tool_message["content"])
+
+    def test_control_desktop_rejected_without_authorization(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        access = FakeDesktopAccess(authorized=False)
+        call = self._desktop_tool_call(
+            "call-input", "control_desktop", {"action": "press", "key": "enter"}
+        )
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "未执行。"},
+                ],
+            ) as complete_message,
+            patch("ai_client.invoke_desktop_skill") as invoke,
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "按回车"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(reply, "未执行。")
+        invoke.assert_not_called()
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertIn("未获得桌面控制授权", tool_message["content"])
+
+    def test_control_desktop_executes_when_authorized(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        access = FakeDesktopAccess(authorized=True)
+        call = self._desktop_tool_call(
+            "call-input", "control_desktop", {"action": "press", "key": "enter"}
+        )
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "已按回车。"},
+                ],
+            ),
+            patch(
+                "ai_client.invoke_desktop_skill",
+                return_value=('{"result":"已按下 enter"}', None),
+            ) as invoke,
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "按回车"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(reply, "已按回车。")
+        invoke.assert_called_once_with({"action": "press", "key": "enter"})
+
+    def test_screenshot_injects_image_message(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        access = FakeDesktopAccess(authorized=True)
+        call = self._desktop_tool_call(
+            "call-shot", "control_desktop", {"action": "screenshot"}
+        )
+        image_bytes = b"\xff\xd8jpeg"
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "截图已分析。"},
+                ],
+            ) as complete_message,
+            patch(
+                "ai_client.invoke_desktop_skill",
+                return_value=(
+                    '{"status":"captured","width":800,"height":600}',
+                    image_bytes,
+                ),
+            ),
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "看看屏幕"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(reply, "截图已分析。")
+        second_messages = complete_message.call_args_list[1].args[0]
+        self.assertEqual(second_messages[-2]["role"], "tool")
+        self.assertEqual(second_messages[-1]["role"], "user")
+        content = second_messages[-1]["content"]
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertIn(
+            base64.b64encode(image_bytes).decode("ascii"),
+            content[1]["image_url"]["url"],
+        )
+
+    def test_screenshot_limit_per_request(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        access = FakeDesktopAccess(authorized=True)
+        calls = [
+            self._desktop_tool_call(
+                f"call-shot-{index}",
+                "control_desktop",
+                {"action": "screenshot"},
+            )
+            for index in range(6)
+        ]
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": calls,
+                    },
+                    {"role": "assistant", "content": "已截屏。"},
+                ],
+            ) as complete_message,
+            patch(
+                "ai_client.invoke_desktop_skill",
+                return_value=('{"status":"captured"}', b"jpeg"),
+            ) as invoke,
+        ):
+            client.complete_with_media_skills(
+                [{"role": "user", "content": "连续截屏"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(invoke.call_count, 5)
+        second_messages = complete_message.call_args_list[1].args[0]
+        tool_messages = [
+            message
+            for message in second_messages
+            if message.get("role") == "tool"
+            and str(message.get("tool_call_id", "")).startswith("call-shot")
+        ]
+        self.assertEqual(len(tool_messages), 6)
+        self.assertIn("截屏上限", tool_messages[-1]["content"])
+
+    def test_stop_request_blocks_desktop_action(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        access = FakeDesktopAccess(authorized=True, stop=True)
+        call = self._desktop_tool_call(
+            "call-input", "control_desktop", {"action": "press", "key": "enter"}
+        )
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "已停止。"},
+                ],
+            ) as complete_message,
+            patch("ai_client.invoke_desktop_skill") as invoke,
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "按回车"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(reply, "已停止。")
+        invoke.assert_not_called()
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertIn("已停止桌面控制", tool_message["content"])
 
 
 if __name__ == "__main__":
