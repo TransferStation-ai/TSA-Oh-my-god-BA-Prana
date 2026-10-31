@@ -18,7 +18,7 @@
 
 ## 当前状态
 
-目前提供一个可运行的 Windows 桌面聊天界面，并已接入兼容 OpenAI Chat Completions API 的模型服务。项目尚未实现代码库索引或自动修改代码。
+目前提供一个可运行的 Windows 桌面聊天界面，并已接入兼容 OpenAI Chat Completions API 的模型服务。项目尚未实现代码库索引或自动提交；代码修改须老师明确请求并经审查模型批准后由 AI 工具调用完成。
 
 **网页阅读：** 可在消息中粘贴最多 3 个公开 HTTP(S) 网页链接，程序会读取 HTML 网页正文并提取图片候选。每页最多读取 1 MB、向模型提供最多 12,000 个正文字符，并提取最多 20 个图片 URL。明确要求发送网页图片时，AI 可调用 `send_web_image` 从本轮候选中选择图片，下载并显示预览（单张最大 10 MB）；该技能不能读取候选列表之外的 URL。此功能按链接读取网页，不提供网页搜索，也不支持需要登录、JavaScript 渲染或非 HTML 的页面。对于 Bilibili 视频链接（`bilibili.com` 域名的 `/video/`、`/short-video/` 路径或 `?bvid=` 查询参数），程序会通过 Bilibili 公开 API 获取视频标题、UP 主、分 P、标签和简介，并附加封面图供模型参考；短链接（如 `b23.tv`）和 UP 主个人空间页不支持。
 
@@ -32,7 +32,7 @@
 
 ### 编码 Agent 与双工作区
 
-主模型可对编码任务（实现功能、修 bug、重构、写测试、运行验证）自主多步推进：用只读工具理解项目，用 `run_shell_command` 执行验证命令，用 `write_workspace_file` / `edit_workspace_file` 改代码，循环直至任务完成或遇到无法解决的错误。单条消息内工具调用受 `MAX_TOOL_ROUNDS = 20` 上限约束；可随时点“停止”中断。
+主模型可对编码任务（实现功能、修 bug、重构、写测试、运行验证）自主多步推进：用只读工具理解项目，用 `run_shell_command` 执行验证命令，用 `write_workspace_file` / `edit_workspace_file` 改代码，循环直至任务完成或遇到无法解决的错误。单条消息内工具调用受 `MAX_TOOL_ROUNDS = 20` 上限约束；点击“停止”会取消请求，并中止正在执行的 shell 命令。
 
 **双工作区模型：**
 
