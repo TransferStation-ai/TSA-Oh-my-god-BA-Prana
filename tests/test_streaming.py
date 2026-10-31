@@ -4,6 +4,7 @@ import unittest
 from streaming import (
     ChatStream,
     ResponsesStream,
+    StreamState,
     chat_reasoning_text,
     format_reasoning_duration,
     iter_sse,
@@ -199,3 +200,50 @@ class StreamBufferTests(unittest.TestCase):
         buffer.close()
         _, closed = buffer.drain()
         self.assertTrue(closed)
+
+
+class StreamStateTests(unittest.TestCase):
+    def test_single_round_thinking_then_content(self) -> None:
+        state = StreamState()
+        actions = state.apply("reasoning", "想", 10.0)
+        actions += state.apply("reasoning", "完了", 13.0)
+        actions += state.apply("content", "答案", 14.0)
+        self.assertEqual(actions[0], ("begin_reasoning", None))
+        self.assertEqual(actions[-2],
+                         ("finish_reasoning", {"text": "想完了", "seconds": 3.0}))
+        self.assertEqual(actions[-1], ("content", "答案"))
+        self.assertEqual(state.content, "答案")
+        self.assertEqual(state.blocks, [{"text": "想完了", "seconds": 3.0}])
+
+    def test_round_event_closes_block_without_content(self) -> None:
+        state = StreamState()
+        state.apply("reasoning", "挑工具", 1.0)
+        actions = state.apply("round", "", 9.0)
+        self.assertEqual(actions, [("finish_reasoning", {"text": "挑工具", "seconds": 1.0})])
+
+    def test_second_round_gets_its_own_block_and_blank_line(self) -> None:
+        state = StreamState()
+        state.apply("reasoning", "第一轮", 1.0)
+        state.apply("content", "先做一点", 2.0)
+        state.apply("round", "", 3.0)
+        actions = state.apply("reasoning", "第二轮", 4.0)
+        self.assertEqual(actions, [("begin_reasoning", None), ("reasoning", "第二轮")])
+        actions = state.apply("content", "收尾", 5.0)
+        self.assertEqual(actions[-1], ("content", "\n\n收尾"))
+        self.assertEqual(state.content, "先做一点\n\n收尾")
+
+    def test_no_reasoning_means_no_block(self) -> None:
+        state = StreamState()
+        self.assertEqual(state.apply("content", "直接回答", 1.0), [("content", "直接回答")])
+        self.assertEqual(state.blocks, [])
+
+    def test_finish_without_active_block_is_noop(self) -> None:
+        state = StreamState()
+        state.apply("content", "好", 1.0)
+        self.assertEqual(state.finish(2.0), [])
+
+    def test_duration_never_below_one_second(self) -> None:
+        state = StreamState()
+        state.apply("reasoning", "短", 5.0)
+        actions = state.apply("content", "答", 5.1)
+        self.assertEqual(actions[0][1]["seconds"], 1.0)

@@ -354,3 +354,69 @@ class StreamBuffer:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+
+
+class StreamState:
+    """把 (kind, text, timestamp) 事件流折算成 UI 动作与思考块。
+
+    每轮最多一个思考块：reasoning 增量打开块，content / round / finish 关闭块。
+    """
+
+    content: str
+    blocks: list[dict[str, object]]
+
+    def __init__(self) -> None:
+        self.content = ""
+        self.blocks = []
+        self._current_text = ""
+        self._started: float | None = None
+        self._last: float | None = None
+        self._separator_pending = False
+
+    def apply(self, kind: str, text: str, timestamp: float) -> list[tuple[str, object]]:
+        """处理一个事件，返回 UI 动作列表。"""
+        if kind == "reasoning":
+            actions: list[tuple[str, object]] = []
+            if self._started is None:
+                self._started = timestamp
+                actions.append(("begin_reasoning", None))
+            self._current_text += text
+            self._last = timestamp
+            actions.append(("reasoning", text))
+            return actions
+        if kind == "content":
+            actions = []
+            if self._started is not None:
+                block = self._close_block()
+                actions.append(("finish_reasoning", block))
+            if text and self._separator_pending:
+                text = "\n\n" + text
+                self._separator_pending = False
+            self.content += text
+            actions.append(("content", text))
+            return actions
+        if kind == "round":
+            actions = []
+            if self._started is not None:
+                actions.append(("finish_reasoning", self._close_block()))
+            if self.content:
+                self._separator_pending = True
+            return actions
+        return []
+
+    def finish(self, timestamp: float) -> list[tuple[str, object]]:
+        """流结束时收掉尚未关闭的思考块。"""
+        if self._started is None:
+            return []
+        return [("finish_reasoning", self._close_block())]
+
+    def _close_block(self) -> dict[str, object]:
+        seconds = self._last - self._started
+        if seconds < 1.0:
+            seconds = 1.0
+        block: dict[str, object] = {"text": self._current_text, "seconds": seconds}
+        self.blocks.append(block)
+        self._current_text = ""
+        self._started = None
+        self._last = None
+        return block
