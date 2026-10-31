@@ -6,6 +6,9 @@
 from __future__ import annotations
 
 import json
+import re
+import threading
+import time
 from typing import Iterable, Iterator
 
 
@@ -244,3 +247,110 @@ class ResponsesStream:
         if name in ("response.failed", "response.incomplete", "error"):
             raise RuntimeError("AI 服务流式响应失败：" + _safe_error_reason(data))
         return []
+
+
+_HEADING_BOLD_RE = re.compile(r"^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)")
+
+
+def reasoning_heading(text: str) -> str:
+    """从 reasoning 正文开头提取一个短标题。"""
+    match = _HEADING_BOLD_RE.match(text)
+    if match:
+        return match.group(1)
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        cleaned = line.replace("`", "").replace("*", "").replace("#", "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if len(cleaned) > 40:
+            cleaned = cleaned[:40] + "…"
+        return cleaned
+    return ""
+
+
+def format_reasoning_duration(seconds: float) -> str:
+    """把已思考时长格式化成 "7s" / "1m 12s"。"""
+    total = max(1, int(seconds))
+    if total >= 60:
+        return f"{total // 60}m {total % 60}s"
+    return f"{total}s"
+
+
+def shimmer_colors(start: str, end: str, steps: int = 6) -> list[str]:
+    """在两个 #rrggbb 之间线性插值出 steps 个十六进制颜色。"""
+    if steps < 2:
+        raise ValueError("shimmer_colors 至少需要 2 步。")
+
+    def parse(value: str) -> tuple[int, int, int]:
+        value = value.lstrip("#")
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+    start_color = parse(start)
+    end_color = parse(end)
+    colors: list[str] = []
+    last = steps - 1
+    for i in range(steps):
+        ratio = i / last
+        channels = []
+        for a, b in zip(start_color, end_color):
+            channels.append(round(a + (b - a) * ratio))
+        colors.append("#{:02x}{:02x}{:02x}".format(*channels))
+    return colors
+
+
+def normalize_reasoning_blocks(value: object) -> list[dict[str, object]]:
+    """把任意输入规整成 [{"text": str, "seconds": float}]，丢弃非法元素。"""
+    if not isinstance(value, list):
+        return []
+    blocks: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        seconds = item.get("seconds")
+        if not isinstance(text, str) or not text:
+            continue
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            continue
+        blocks.append({"text": text, "seconds": float(seconds)})
+    return blocks
+
+
+def should_follow(viewport_bottom: float, threshold: float = 0.98) -> bool:
+    """视口贴底（或超过阈值）时允许自动滚动跟随。"""
+    return viewport_bottom >= threshold
+
+
+class StreamBuffer:
+    """工作线程写入、UI 线程定时取走的事件缓冲。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: list[tuple[str, str, float]] = []
+        self._closed = False
+        self._wakeup_posted = False
+
+    def push(self, kind: str, text: str) -> None:
+        with self._lock:
+            self._events.append((kind, text, time.monotonic()))
+
+    def request_wakeup(self) -> bool:
+        """请求一次唤醒；重复请求会被合并，返回是否是本次第一次。"""
+        with self._lock:
+            if self._wakeup_posted:
+                return False
+            self._wakeup_posted = True
+            return True
+
+    def drain(self) -> tuple[list[tuple[str, str, float]], bool]:
+        """取走全部事件并复位唤醒标记；返回 (事件列表, 流是否已结束)。"""
+        with self._lock:
+            events = self._events
+            self._events = []
+            self._wakeup_posted = False
+            closed = self._closed
+        return events, closed
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True

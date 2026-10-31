@@ -5,8 +5,14 @@ from streaming import (
     ChatStream,
     ResponsesStream,
     chat_reasoning_text,
+    format_reasoning_duration,
     iter_sse,
+    normalize_reasoning_blocks,
+    reasoning_heading,
     responses_reasoning_text,
+    shimmer_colors,
+    should_follow,
+    StreamBuffer,
 )
 
 
@@ -133,3 +139,63 @@ class ReasoningExtractionTests(unittest.TestCase):
             {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "正文"}]},
         ]}
         self.assertEqual(responses_reasoning_text(payload), "摘要正文")
+
+
+class DisplayLogicTests(unittest.TestCase):
+    def test_heading_prefers_bold_title(self) -> None:
+        self.assertEqual(reasoning_heading("**梳理目录**\n\n先看文件。"), "梳理目录")
+
+    def test_heading_falls_back_to_first_line(self) -> None:
+        self.assertEqual(reasoning_heading("## 看 `main.py`\n后面的内容"), "看 main.py")
+
+    def test_heading_truncates_at_40(self) -> None:
+        self.assertEqual(len(reasoning_heading("字" * 60)), 41)
+        self.assertTrue(reasoning_heading("字" * 60).endswith("…"))
+
+    def test_heading_empty(self) -> None:
+        self.assertEqual(reasoning_heading("  \n\n"), "")
+
+    def test_duration_formats(self) -> None:
+        self.assertEqual(format_reasoning_duration(0.2), "1s")
+        self.assertEqual(format_reasoning_duration(7.4), "7s")
+        self.assertEqual(format_reasoning_duration(72), "1m 12s")
+
+    def test_shimmer_colors_endpoints(self) -> None:
+        colors = shimmer_colors("#a4a5b5", "#f1f1f5", 6)
+        self.assertEqual(colors[0], "#a4a5b5")
+        self.assertEqual(colors[-1], "#f1f1f5")
+        self.assertEqual(len(colors), 6)
+
+    def test_normalize_blocks_drops_junk(self) -> None:
+        self.assertEqual(
+            normalize_reasoning_blocks([
+                {"text": "好", "seconds": 3},
+                {"text": "", "seconds": 9},
+                "x",
+                {"seconds": 2},
+                {"text": "坏", "seconds": "NaN"},
+            ]),
+            [{"text": "好", "seconds": 3.0}],
+        )
+        self.assertEqual(normalize_reasoning_blocks(None), [])
+
+    def test_should_follow(self) -> None:
+        self.assertTrue(should_follow(1.0))
+        self.assertTrue(should_follow(0.98))
+        self.assertFalse(should_follow(0.5))
+
+
+class StreamBufferTests(unittest.TestCase):
+    def test_wakeup_is_coalesced_and_drain_resets(self) -> None:
+        buffer = StreamBuffer()
+        self.assertTrue(buffer.request_wakeup())
+        self.assertFalse(buffer.request_wakeup())
+        buffer.push("content", "你好")
+        events, closed = buffer.drain()
+        self.assertEqual([kind for kind, _, _ in events], ["content"])
+        self.assertFalse(closed)
+        self.assertTrue(buffer.request_wakeup())
+        buffer.push("round", "")
+        buffer.close()
+        _, closed = buffer.drain()
+        self.assertTrue(closed)
