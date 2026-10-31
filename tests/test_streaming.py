@@ -247,3 +247,19 @@ class StreamStateTests(unittest.TestCase):
         state.apply("reasoning", "短", 5.0)
         actions = state.apply("content", "答", 5.1)
         self.assertEqual(actions[0][1]["seconds"], 1.0)
+
+    def test_finish_closes_active_block(self) -> None:
+        state = StreamState()
+        state.apply("reasoning", "想透了", 2.0)
+        self.assertEqual(
+            state.finish(9.0),
+            [("finish_reasoning", {"text": "想透了", "seconds": 7.0})],
+        )
+        self.assertEqual(state.blocks, [{"text": "想透了", "seconds": 7.0}])
+        # finish 路径同样执行 1 秒下限 clamp，并保证重复 finish 为 noop。
+        state.apply("reasoning", "再想一遍", 20.0)
+        self.assertEqual(
+            state.finish(20.1),
+            [("finish_reasoning", {"text": "再想一遍", "seconds": 1.0})],
+        )
+        self.assertEqual(state.finish(21.0), [])

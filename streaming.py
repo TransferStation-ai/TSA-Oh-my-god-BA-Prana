@@ -385,7 +385,7 @@ class StreamState:
             actions.append(("reasoning", text))
             return actions
         if kind == "content":
-            actions = []
+            actions: list[tuple[str, object]] = []
             if self._started is not None:
                 block = self._close_block()
                 actions.append(("finish_reasoning", block))
@@ -396,7 +396,7 @@ class StreamState:
             actions.append(("content", text))
             return actions
         if kind == "round":
-            actions = []
+            actions: list[tuple[str, object]] = []
             if self._started is not None:
                 actions.append(("finish_reasoning", self._close_block()))
             if self.content:
@@ -405,14 +405,21 @@ class StreamState:
         return []
 
     def finish(self, timestamp: float) -> list[tuple[str, object]]:
-        """流结束时收掉尚未关闭的思考块。"""
+        """流结束时收掉尚未关闭的思考块。
+
+        ``timestamp`` 是流结束时间：reasoning 到该时刻仍无正文或回合边界可收，
+        块时长以它作为推理终点，按 ``timestamp - started``（不低于 1 秒）计。
+        """
         if self._started is None:
             return []
-        return [("finish_reasoning", self._close_block())]
+        return [("finish_reasoning", self._close_block(end=timestamp))]
 
-    def _close_block(self) -> dict[str, object]:
-        seconds = self._last - self._started
-        if seconds < 1.0:
+    def _close_block(self, end: float | None = None) -> dict[str, object]:
+        started = self._started
+        last = end if end is not None else self._last
+        if started is not None and last is not None:
+            seconds = max(1.0, last - started)
+        else:
             seconds = 1.0
         block: dict[str, object] = {"text": self._current_text, "seconds": seconds}
         self.blocks.append(block)
