@@ -410,5 +410,77 @@ def test_write_workspace_file_rejects_bad_workspace(tmp_path):
         )
 
 
+def test_transfer_scratch_to_permanent(tmp_path, monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from skills import invoke_workspace_skill
+
+    scratch = Path(tempfile.gettempdir()) / "prana-scratch"
+    scratch.mkdir(exist_ok=True)
+    (scratch / "a.txt").write_text("hello")
+
+    invoke_workspace_skill(
+        "transfer_workspace_file",
+        {
+            "source_workspace": "scratch",
+            "source_path": "a.txt",
+            "target_workspace": "permanent",
+            "target_path": "a.txt",
+        },
+        workspace_root=tmp_path,
+    )
+    assert (tmp_path / "a.txt").read_text() == "hello"
+
+
+def test_transfer_rejects_existing_target_without_overwrite(tmp_path, monkeypatch):
+    import tempfile
+    from pathlib import Path
+    from skills import invoke_workspace_skill
+    import pytest
+
+    scratch = Path(tempfile.gettempdir()) / "prana-scratch"
+    scratch.mkdir(exist_ok=True)
+    (scratch / "b.txt").write_text("hello")
+    (tmp_path / "b.txt").write_text("old")
+
+    with pytest.raises(ValueError):
+        invoke_workspace_skill(
+            "transfer_workspace_file",
+            {
+                "source_workspace": "scratch",
+                "source_path": "b.txt",
+                "target_workspace": "permanent",
+                "target_path": "b.txt",
+            },
+            workspace_root=tmp_path,
+        )
+
+
+def test_switch_workspace_requires_existing_dir(tmp_path):
+    from skills import invoke_workspace_skill
+    import pytest
+
+    with pytest.raises(ValueError):
+        invoke_workspace_skill(
+            "switch_workspace",
+            {"path": str(tmp_path / "nope")},
+            workspace_root=tmp_path,
+        )
+
+
+def test_switch_workspace_accepts_existing_dir(tmp_path):
+    import json
+    from skills import invoke_workspace_skill
+
+    out = invoke_workspace_skill(
+        "switch_workspace",
+        {"path": str(tmp_path)},
+        workspace_root=tmp_path,
+    )
+    parsed = json.loads(out)
+    assert parsed["status"] == "switched"
+    assert parsed["path"] == str(tmp_path.resolve())
+
+
 if __name__ == "__main__":
     unittest.main()

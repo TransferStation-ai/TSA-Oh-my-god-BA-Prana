@@ -233,6 +233,59 @@ WORKSPACE_SKILLS: list[dict[str, object]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfer_workspace_file",
+            "description": (
+                "Copy a file from one workspace to another, typically to "
+                "persist a scratch artifact into the permanent workspace. "
+                "Requires review approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                    },
+                    "source_path": {"type": "string"},
+                    "target_workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                    },
+                    "target_path": {"type": "string"},
+                    "overwrite": {"type": "boolean"},
+                },
+                "required": ["source_path", "target_path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "switch_workspace",
+            "description": (
+                "Switch the active permanent workspace to a user-told path. "
+                "Path must exist and be a directory. Requires review "
+                "approval because it changes the working scope."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to the new permanent workspace."
+                        ),
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -334,7 +387,43 @@ def validate_workspace_skill_arguments(
     if name == "edit_workspace_file":
         _validate_edit_file_arguments(arguments)
         return
+    if name == "transfer_workspace_file":
+        _validate_transfer_file_arguments(arguments)
+        return
+    if name == "switch_workspace":
+        _validate_switch_workspace_arguments(arguments)
+        return
     raise ValueError(f"未知的工作区 skill：{name}")
+
+
+def _validate_transfer_file_arguments(arguments: object) -> None:
+    if not isinstance(arguments, dict) or not set(arguments).issubset(
+        {"source_workspace", "source_path", "target_workspace", "target_path", "overwrite"}
+    ):
+        raise ValueError("文件转移 skill 参数无效。")
+    source_path = arguments.get("source_path")
+    if not isinstance(source_path, str) or not source_path.strip():
+        raise ValueError("source_path 必须是非空字符串。")
+    target_path = arguments.get("target_path")
+    if not isinstance(target_path, str) or not target_path.strip():
+        raise ValueError("target_path 必须是非空字符串。")
+    source_workspace = arguments.get("source_workspace", "scratch")
+    if source_workspace not in {"permanent", "scratch"}:
+        raise ValueError("source_workspace 只能是 permanent 或 scratch。")
+    target_workspace = arguments.get("target_workspace", "permanent")
+    if target_workspace not in {"permanent", "scratch"}:
+        raise ValueError("target_workspace 只能是 permanent 或 scratch。")
+    overwrite = arguments.get("overwrite", False)
+    if not isinstance(overwrite, bool):
+        raise ValueError("overwrite 必须是布尔值。")
+
+
+def _validate_switch_workspace_arguments(arguments: object) -> None:
+    if not isinstance(arguments, dict) or not set(arguments).issubset({"path"}):
+        raise ValueError("工作区切换 skill 参数无效。")
+    path = arguments.get("path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("path 必须是非空字符串。")
 
 
 def _validate_write_file_arguments(arguments: object) -> None:
@@ -647,6 +736,61 @@ def _count_occurrences(text: str, old_string: str, start: int = 0) -> int:
     return count
 
 
+def _transfer_workspace_file(
+    root: Path, arguments: object, scratch_root: Path | None = None
+) -> str:
+    assert isinstance(arguments, dict)
+    source_workspace = str(arguments.get("source_workspace", "scratch"))
+    source_path = str(arguments["source_path"])
+    target_workspace = str(arguments.get("target_workspace", "permanent"))
+    target_path = str(arguments["target_path"])
+    overwrite = bool(arguments.get("overwrite", False))
+    source_root = resolve_workspace_root(
+        source_workspace, root, scratch_root
+    )
+    target_root = resolve_workspace_root(
+        target_workspace, root, scratch_root
+    )
+    source = (source_root / source_path).resolve()
+    target = (target_root / target_path).resolve()
+    try:
+        source.relative_to(source_root)
+    except ValueError as error:
+        raise ValueError("源路径必须位于所选工作区内。") from error
+    try:
+        target.relative_to(target_root)
+    except ValueError as error:
+        raise ValueError("目标路径必须位于所选工作区内。") from error
+    if not source.is_file():
+        raise ValueError(f"源文件未找到：{source_path}。")
+    if target.is_file() and not overwrite:
+        raise ValueError(
+            f"目标已存在：{target_path}。如需覆盖请设 overwrite=true。"
+        )
+    data = source.read_bytes()
+    _atomic_write_text(target, data.decode("utf-8", "replace"))
+    return json.dumps(
+        {
+            "from": f"{source_workspace}:{source_path}",
+            "to": f"{target_workspace}:{target_path}",
+            "bytes": len(data),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _switch_workspace(arguments: object) -> str:
+    assert isinstance(arguments, dict)
+    path = str(arguments["path"]).strip()
+    target = Path(path)
+    if not target.is_dir():
+        raise ValueError("目标路径不存在或不是目录。")
+    return json.dumps(
+        {"status": "switched", "path": str(target.resolve())},
+        ensure_ascii=False,
+    )
+
+
 def _edit_workspace_file(root: Path, arguments: object) -> str:
     assert isinstance(arguments, dict)
     path = str(arguments["path"])
@@ -718,6 +862,12 @@ def invoke_workspace_skill(
         return _write_workspace_file(root, arguments)
     if name == "edit_workspace_file":
         return _edit_workspace_file(root, arguments)
+    if name == "transfer_workspace_file":
+        return _transfer_workspace_file(
+            root, arguments, scratch_root
+        )
+    if name == "switch_workspace":
+        return _switch_workspace(arguments)
     if name == "get_project_structure":
         path, max_depth = _validate_project_structure_arguments(arguments)
         root, target = _resolve_workspace_directory(root, path)
