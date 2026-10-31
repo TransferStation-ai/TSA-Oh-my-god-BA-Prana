@@ -482,5 +482,64 @@ def test_switch_workspace_accepts_existing_dir(tmp_path):
     assert parsed["path"] == str(tmp_path.resolve())
 
 
+def test_transfer_preserves_binary_bytes(tmp_path):
+    import json
+    from skills import invoke_workspace_skill
+
+    scratch = tmp_path / "scratch"
+    permanent = tmp_path / "permanent"
+    scratch.mkdir()
+    permanent.mkdir()
+    payload = b"\x00\xff\xfe\x01binary"
+    (scratch / "blob.bin").write_bytes(payload)
+
+    out = invoke_workspace_skill(
+        "transfer_workspace_file",
+        {
+            "source_workspace": "scratch",
+            "source_path": "blob.bin",
+            "target_workspace": "permanent",
+            "target_path": "blob.bin",
+        },
+        workspace_root=permanent,
+        scratch_root=scratch,
+    )
+
+    assert (permanent / "blob.bin").read_bytes() == payload
+    assert json.loads(out)["bytes"] == len(payload)
+
+
+def test_scratch_write_and_search_roundtrip(tmp_path):
+    import json
+    from skills import invoke_workspace_skill
+
+    scratch = tmp_path / "scratch"
+    permanent = tmp_path / "permanent"
+    scratch.mkdir()
+    permanent.mkdir()
+
+    invoke_workspace_skill(
+        "write_workspace_file",
+        {
+            "path": "note.txt",
+            "content": "needle-value",
+            "workspace": "scratch",
+        },
+        workspace_root=permanent,
+        scratch_root=scratch,
+    )
+    out = invoke_workspace_skill(
+        "search_workspace_files",
+        {"mode": "content", "query": "needle-value", "workspace": "scratch"},
+        workspace_root=permanent,
+        scratch_root=scratch,
+    )
+
+    assert (scratch / "note.txt").read_text(encoding="utf-8") == "needle-value"
+    assert [item["path"] for item in json.loads(out)["results"]] == [
+        "note.txt"
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()

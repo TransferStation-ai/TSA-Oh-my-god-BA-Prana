@@ -38,3 +38,53 @@ def test_validate_accepts_valid():
             "workdir": "sub",
         }
     )
+
+
+def test_invoke_runs_real_powershell_command(tmp_path):
+    from skills.terminal import invoke_shell_skill
+
+    result = json.loads(
+        invoke_shell_skill(
+            {"command": "Write-Output hi", "description": "输出 hi"},
+            permanent_root=tmp_path,
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert result["canceled"] is False
+    assert result["timed_out"] is False
+    assert "hi" in result["stdout"].strip()
+
+
+def test_invoke_rejects_workdir_outside_workspace(tmp_path):
+    import pytest
+    from skills.terminal import invoke_shell_skill
+
+    with pytest.raises(ValueError):
+        invoke_shell_skill(
+            {
+                "command": "Get-Location",
+                "description": "越界工作目录",
+                "workdir": "..",
+            },
+            permanent_root=tmp_path,
+        )
+
+
+def test_invoke_cancels_running_command_when_stopped(tmp_path):
+    from skills.terminal import invoke_shell_skill
+
+    result = json.loads(
+        invoke_shell_skill(
+            {
+                "command": "Start-Sleep -Seconds 10",
+                "description": "等待并应被取消",
+                "timeout_seconds": 30,
+            },
+            permanent_root=tmp_path,
+            should_stop=lambda: True,
+        )
+    )
+
+    assert result["canceled"] is True
+    assert result["timed_out"] is False

@@ -2911,6 +2911,167 @@ class AIClientTests(unittest.TestCase):
         self.assertEqual(tool_message["role"], "tool")
         self.assertIn("switched", tool_message["content"])
 
+    def test_switch_workspace_callback_updates_provider_for_later_tools(
+        self,
+    ) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        switch_arguments = {"path": "D:\\new-area"}
+        shell_arguments = {
+            "command": "Get-ChildItem",
+            "description": "验证切换后的工作区",
+        }
+        switch_call = {
+            "id": "call-switch",
+            "type": "function",
+            "function": {
+                "name": "switch_workspace",
+                "arguments": json.dumps(switch_arguments),
+            },
+        }
+        shell_call = {
+            "id": "call-shell",
+            "type": "function",
+            "function": {
+                "name": "run_shell_command",
+                "arguments": json.dumps(shell_arguments),
+            },
+        }
+        state = {"root": Path("D:\\old-area")}
+        switched: list[str] = []
+
+        def provider() -> Path | None:
+            return state["root"]
+
+        def on_switched(path: str) -> None:
+            switched.append(path)
+            state["root"] = Path(path)
+
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [switch_call, shell_call],
+                },
+                {"role": "assistant", "content": "完成。"},
+            ],
+        ), patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ), patch(
+            "ai_client.invoke_workspace_skill",
+            return_value='{"status":"switched","path":"D:\\\\new-area"}',
+        ), patch(
+            "ai_client.invoke_shell_skill",
+            return_value='{"output":"ok"}',
+        ) as invoke_shell:
+            reply, _media = client.complete_with_media_skills(
+                [{"role": "user", "content": "在 D:\\new-area 工作后验证"}],
+                permanent_root=state["root"],
+                permanent_root_provider=provider,
+                on_workspace_switched=on_switched,
+            )
+
+        self.assertEqual(reply, "完成。")
+        self.assertEqual(switched, ["D:\\new-area"])
+        invoke_shell.assert_called_once_with(
+            shell_arguments, permanent_root=Path("D:\\new-area")
+        )
+
+    def test_scratch_write_review_mentions_persistence_transfer(
+        self,
+    ) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        with patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ) as review:
+            client._review_workspace_operation(
+                "write_workspace_file",
+                {
+                    "path": "a.txt",
+                    "content": "x",
+                    "workspace": "scratch",
+                },
+                [{"role": "user", "content": "在临时区写 a.txt"}],
+            )
+
+        payload = json.loads(review.call_args.args[1][1]["content"])
+        effect = payload["proposed_operation"]["effect"]
+        self.assertIn("临时工作区", effect)
+        self.assertIn("transfer_workspace_file", effect)
+
+    def test_shell_oserror_becomes_tool_error_result(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        shell_call = {
+            "id": "call-shell",
+            "type": "function",
+            "function": {
+                "name": "run_shell_command",
+                "arguments": json.dumps(
+                    {
+                        "command": "Get-ChildItem",
+                        "description": "列出文件",
+                    }
+                ),
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [shell_call],
+                },
+                {"role": "assistant", "content": "结束。"},
+            ],
+        ) as complete_message, patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ), patch(
+            "ai_client.invoke_shell_skill",
+            side_effect=FileNotFoundError("powershell missing"),
+        ):
+            reply, _media = client.complete_with_media_skills(
+                [{"role": "user", "content": "列出文件"}]
+            )
+
+        self.assertEqual(reply, "结束。")
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("powershell missing", tool_message["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
