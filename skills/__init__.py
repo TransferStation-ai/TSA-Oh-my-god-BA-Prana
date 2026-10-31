@@ -13,10 +13,13 @@ from skills.qq_music import (
     validate_qq_music_arguments,
 )
 from skills.terminal import (
+    SHELL_SKILLS,
     TERMINAL_SKILLS,
     TIME_SKILLS,
+    invoke_shell_skill,
     invoke_system_time_skill,
     invoke_terminal_skill,
+    validate_shell_command,
     validate_system_time_arguments,
     validate_terminal_command,
 )
@@ -34,6 +37,7 @@ __all__ = [
     "GIT_SKILLS",
     "MEDIA_SKILLS",
     "QQ_MUSIC_SKILLS",
+    "SHELL_SKILLS",
     "TERMINAL_SKILLS",
     "TIME_SKILLS",
     "WORKSPACE_SKILLS",
@@ -41,6 +45,7 @@ __all__ = [
     "invoke_git_skill",
     "invoke_media_skill",
     "invoke_qq_music_skill",
+    "invoke_shell_skill",
     "invoke_system_time_skill",
     "invoke_terminal_skill",
     "invoke_workspace_skill",
@@ -50,6 +55,7 @@ __all__ = [
     "validate_git_arguments",
     "validate_qq_music_arguments",
     "validate_system_time_arguments",
+    "validate_shell_command",
     "validate_terminal_command",
     "validate_workspace_skill_arguments",
 ]

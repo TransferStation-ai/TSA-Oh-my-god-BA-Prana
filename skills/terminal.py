@@ -7,6 +7,10 @@ from pathlib import Path
 MAX_TERMINAL_OUTPUT_LENGTH = 20000
 MAX_TERMINAL_FILE_BYTES = 64 * 1024
 MAX_TERMINAL_DIRECTORY_ENTRIES = 100
+MAX_SHELL_OUTPUT_BYTES = 16 * 1024
+MAX_SHELL_COMMAND_LENGTH = 5000
+MAX_SHELL_TIMEOUT_SECONDS = 300
+DEFAULT_SHELL_TIMEOUT_SECONDS = 300
 
 TERMINAL_SKILLS: list[dict[str, object]] = [
     {
@@ -261,6 +265,154 @@ def invoke_system_time_skill(arguments: object = None) -> str:
             "datetime": now.isoformat(timespec="seconds"),
             "timezone": "local",
             "formatted": now.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        ensure_ascii=False,
+    )
+
+
+SHELL_SKILLS: list[dict[str, object]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_command",
+            "description": (
+                "Run one PowerShell command in the selected workspace to "
+                "inspect, build, lint, test, or run the project. Use only "
+                "for explicit coding/verification tasks. The command runs "
+                "in the OS shell under the user's account and must be "
+                "approved by the review model. Do not run destructive "
+                "commands unless the user explicitly asks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "One PowerShell command.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Why the command is run.",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_SHELL_TIMEOUT_SECONDS,
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": (
+                            "Optional workspace-relative subdirectory."
+                        ),
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                    },
+                },
+                "required": ["command", "description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def validate_shell_command(arguments: object) -> None:
+    if not isinstance(arguments, dict):
+        raise ValueError("Shell 命令参数无效。")
+    if not set(arguments).issubset(
+        {"command", "description", "timeout_seconds", "workdir", "workspace"}
+    ):
+        raise ValueError("Shell 命令参数无效。")
+    command = arguments.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("command 必须是非空字符串。")
+    if len(command) > MAX_SHELL_COMMAND_LENGTH:
+        raise ValueError("command 过长。")
+    description = arguments.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError("description 必须是非空字符串。")
+    timeout = arguments.get("timeout_seconds", DEFAULT_SHELL_TIMEOUT_SECONDS)
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        raise ValueError("timeout_seconds 必须是整数。")
+    if not 1 <= timeout <= MAX_SHELL_TIMEOUT_SECONDS:
+        raise ValueError("timeout_seconds 必须在 1 到 300 之间。")
+    workdir = arguments.get("workdir")
+    if workdir is not None and (
+        not isinstance(workdir, str) or not workdir.strip()
+    ):
+        raise ValueError("workdir 必须是非空字符串。")
+    workspace = arguments.get("workspace", "permanent")
+    if workspace not in {"permanent", "scratch"}:
+        raise ValueError("workspace 只能是 permanent 或 scratch。")
+
+
+def invoke_shell_skill(
+    arguments: object,
+    *,
+    permanent_root: Path | None = None,
+    scratch_root: Path | None = None,
+) -> str:
+    validate_shell_command(arguments)
+    from skills.workspace import resolve_workspace_root
+
+    assert isinstance(arguments, dict)
+    command = str(arguments["command"])
+    timeout = int(arguments.get("timeout_seconds", DEFAULT_SHELL_TIMEOUT_SECONDS))
+    workdir = str(arguments.get("workdir") or "")
+    workspace = str(arguments.get("workspace", "permanent"))
+
+    root = resolve_workspace_root(workspace, permanent_root, scratch_root)
+    target = (root / workdir).resolve() if workdir else root
+    if workdir:
+        try:
+            target.relative_to(root)
+        except ValueError as error:
+            raise ValueError("workdir 必须位于所选工作区内。") from error
+        if not target.is_dir():
+            raise ValueError("workdir 不存在或不是目录。")
+
+    import os
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NoLogo", "-Command", command],
+            cwd=target,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=(
+                subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            ),
+        )
+        timed_out = False
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        exit_code = result.returncode
+    except subprocess.TimeoutExpired as error:
+        timed_out = True
+        stdout = error.stdout or "" if error.stdout else ""
+        stderr = error.stderr or "" if error.stderr else ""
+        exit_code = -1
+
+    stdout_b = stdout.encode("utf-8", "replace")[:MAX_SHELL_OUTPUT_BYTES]
+    stderr_b = stderr.encode("utf-8", "replace")[:MAX_SHELL_OUTPUT_BYTES]
+    truncated = (
+        len(stdout.encode("utf-8", "replace")) > MAX_SHELL_OUTPUT_BYTES
+        or len(stderr.encode("utf-8", "replace")) > MAX_SHELL_OUTPUT_BYTES
+    )
+    return json.dumps(
+        {
+            "exit_code": exit_code,
+            "stdout": stdout_b.decode("utf-8", "replace"),
+            "stderr": stderr_b.decode("utf-8", "replace"),
+            "timed_out": timed_out,
+            "truncated": truncated,
+            "workspace": workspace,
         },
         ensure_ascii=False,
     )
