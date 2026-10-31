@@ -2702,11 +2702,214 @@ class AIClientTests(unittest.TestCase):
         )
 
 
-def test_shell_skills_imported_by_ai_client():
-    import ai_client
-    assert hasattr(ai_client, "SHELL_SKILLS")
-    names = [tool["function"]["name"] for tool in ai_client.SHELL_SKILLS]
-    assert "run_shell_command" in names
+    def test_shell_skills_imported_by_ai_client(self) -> None:
+        import ai_client
+
+        self.assertTrue(hasattr(ai_client, "SHELL_SKILLS"))
+        names = [tool["function"]["name"] for tool in ai_client.SHELL_SKILLS]
+        self.assertIn("run_shell_command", names)
+
+    def test_run_shell_command_dispatch_review_and_inject(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        permanent_root = Path("D:\\permanent-area")
+        arguments = {
+            "command": "Get-ChildItem",
+            "description": "列出永久工作区文件",
+        }
+        shell_call = {
+            "id": "call-shell",
+            "type": "function",
+            "function": {
+                "name": "run_shell_command",
+                "arguments": json.dumps(arguments),
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [shell_call],
+                },
+                {"role": "assistant", "content": "Shell 命令已执行。"},
+            ],
+        ), patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ) as review, patch(
+            "ai_client.invoke_shell_skill",
+            return_value='{"output":"a.txt"}',
+        ) as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "执行 shell 命令"}],
+                permanent_root=permanent_root,
+            )
+
+        self.assertEqual(reply, "Shell 命令已执行。")
+        self.assertEqual(media, [])
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[0].model, "review-model")
+        review_payload = json.loads(review.call_args.args[1][1]["content"])
+        self.assertEqual(
+            review_payload["proposed_operation"]["skill"],
+            "run_shell_command",
+        )
+        self.assertEqual(
+            review_payload["proposed_operation"]["arguments"], arguments
+        )
+        invoke.assert_called_once_with(
+            arguments, permanent_root=permanent_root
+        )
+
+    def test_transfer_workspace_file_dispatch_injects_workspace_root(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        permanent_root = Path("D:\\permanent-area")
+        arguments = {"source_path": "build/out.exe", "target_path": "out.exe"}
+        transfer_call = {
+            "id": "call-transfer",
+            "type": "function",
+            "function": {
+                "name": "transfer_workspace_file",
+                "arguments": json.dumps(arguments),
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [transfer_call],
+                },
+                {"role": "assistant", "content": "文件已转移到永久工作区。"},
+            ],
+        ) as complete_message, patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ) as review, patch(
+            "ai_client.invoke_workspace_skill",
+            return_value='{"status":"copied","destination":"D:\\permanent-area\\out.exe"}',
+        ) as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "把 out.exe 复制到永久工作区"}],
+                permanent_root=permanent_root,
+            )
+
+        self.assertEqual(reply, "文件已转移到永久工作区。")
+        self.assertEqual(media, [])
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[0].model, "review-model")
+        review_payload = json.loads(review.call_args.args[1][1]["content"])
+        self.assertEqual(
+            review_payload["proposed_operation"]["skill"],
+            "transfer_workspace_file",
+        )
+        self.assertEqual(
+            review_payload["proposed_operation"]["arguments"], arguments
+        )
+        invoke.assert_called_once_with(
+            "transfer_workspace_file", arguments, workspace_root=permanent_root
+        )
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("copied", tool_message["content"])
+
+    def test_switch_workspace_review_missing_model_raises(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "尚未配置操作审查模型"
+        ):
+            client._review_switch_workspace(
+                {"path": "D:\\new-area"},
+                [{"role": "user", "content": "在 D:\\new-area 工作"}],
+            )
+
+    def test_switch_workspace_dispatch_review_and_inject(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        arguments = {"path": "D:\\new-area"}
+        switch_call = {
+            "id": "call-switch",
+            "type": "function",
+            "function": {
+                "name": "switch_workspace",
+                "arguments": json.dumps(arguments),
+            },
+        }
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [switch_call],
+                },
+                {"role": "assistant", "content": "已切换工作区。"},
+            ],
+        ) as complete_message, patch.object(
+            AIClient,
+            "complete",
+            autospec=True,
+            return_value='{"decision":"allow","reason":"用户明确要求"}',
+        ) as review, patch(
+            "ai_client.invoke_workspace_skill",
+            return_value='{"status":"switched","directory":"D:\\new-area"}',
+        ) as invoke:
+            reply, media = client.complete_with_media_skills(
+                [{"role": "user", "content": "在 D:\\new-area 工作"}],
+                permanent_root=Path("D:\\new-area"),
+            )
+
+        self.assertEqual(reply, "已切换工作区。")
+        self.assertEqual(media, [])
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[0].model, "review-model")
+        review_payload = json.loads(review.call_args.args[1][1]["content"])
+        self.assertEqual(
+            review_payload["proposed_operation"]["skill"],
+            "switch_workspace",
+        )
+        self.assertEqual(
+            review_payload["proposed_operation"]["arguments"], arguments
+        )
+        invoke.assert_called_once_with("switch_workspace", arguments)
+        tool_message = complete_message.call_args_list[1].args[0][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("switched", tool_message["content"])
 
 
 if __name__ == "__main__":
