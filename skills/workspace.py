@@ -61,6 +61,15 @@ WORKSPACE_SKILLS: list[dict[str, object]] = [
                             "Maximum directory depth to display. Defaults to 2."
                         ),
                     },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                        "description": (
+                            "Target workspace. permanent = app project dir or a "
+                            "user-told path; scratch = %TEMP%\\prana-scratch. "
+                            "Defaults to permanent."
+                        ),
+                    },
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -109,6 +118,15 @@ WORKSPACE_SKILLS: list[dict[str, object]] = [
                             f"{DEFAULT_SEARCH_RESULTS}."
                         ),
                     },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                        "description": (
+                            "Target workspace. permanent = app project dir or a "
+                            "user-told path; scratch = %TEMP%\\prana-scratch. "
+                            "Defaults to permanent."
+                        ),
+                    },
                 },
                 "required": ["mode", "query"],
                 "additionalProperties": False,
@@ -146,6 +164,15 @@ WORKSPACE_SKILLS: list[dict[str, object]] = [
                         "description": (
                             "Set true to replace a file that already exists. "
                             "Defaults to false, which refuses existing files."
+                        ),
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                        "description": (
+                            "Target workspace. permanent = app project dir or a "
+                            "user-told path; scratch = %TEMP%\\prana-scratch. "
+                            "Defaults to permanent."
                         ),
                     },
                 },
@@ -191,6 +218,15 @@ WORKSPACE_SKILLS: list[dict[str, object]] = [
                             "oldString. Defaults to false (single match)."
                         ),
                     },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                        "description": (
+                            "Target workspace. permanent = app project dir or a "
+                            "user-told path; scratch = %TEMP%\\prana-scratch. "
+                            "Defaults to permanent."
+                        ),
+                    },
                 },
                 "required": ["path", "oldString", "newString"],
                 "additionalProperties": False,
@@ -231,7 +267,7 @@ def _validate_project_structure_arguments(
     arguments: object,
 ) -> tuple[str | None, int]:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"path", "max_depth"}
+        {"path", "max_depth", "workspace"}
     ):
         raise ValueError("项目结构 skill 参数无效。")
     path = validate_workspace_path(arguments.get("path"))
@@ -249,7 +285,7 @@ def _validate_search_arguments(
     arguments: object,
 ) -> tuple[str, str, str | None, int]:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"mode", "query", "path", "max_results"}
+        {"mode", "query", "path", "max_results", "workspace"}
     ):
         raise ValueError("工作区搜索 skill 参数无效。")
     mode = arguments.get("mode")
@@ -303,7 +339,7 @@ def validate_workspace_skill_arguments(
 
 def _validate_write_file_arguments(arguments: object) -> None:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"path", "content", "overwrite"}
+        {"path", "content", "overwrite", "workspace"}
     ):
         raise ValueError("写文件 skill 参数无效。")
     path = arguments.get("path")
@@ -323,7 +359,7 @@ def _validate_write_file_arguments(arguments: object) -> None:
 
 def _validate_edit_file_arguments(arguments: object) -> None:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"path", "oldString", "newString", "replaceAll"}
+        {"path", "oldString", "newString", "replaceAll", "workspace"}
     ):
         raise ValueError("编辑文件 skill 参数无效。")
     path = arguments.get("path")
@@ -667,9 +703,17 @@ def invoke_workspace_skill(
     arguments: object,
     *,
     workspace_root: Path | None = None,
+    scratch_root: Path | None = None,
 ) -> str:
     validate_workspace_skill_arguments(name, arguments)
-    root = (workspace_root or default_workspace_root()).resolve()
+    workspace = "permanent"
+    if isinstance(arguments, dict):
+        workspace = arguments.get("workspace", "permanent")
+    root = resolve_workspace_root(
+        workspace,
+        permanent_root=workspace_root,
+        scratch_root=scratch_root,
+    )
     if name == "write_workspace_file":
         return _write_workspace_file(root, arguments)
     if name == "edit_workspace_file":

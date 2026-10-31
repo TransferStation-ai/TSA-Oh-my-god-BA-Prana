@@ -53,6 +53,15 @@ GIT_SKILLS: list[dict[str, object]] = [
                             "such as HEAD~1 or main..HEAD."
                         ),
                     },
+                    "workspace": {
+                        "type": "string",
+                        "enum": ["permanent", "scratch"],
+                        "description": (
+                            "Target workspace. permanent = app project dir or a "
+                            "user-told path; scratch = %TEMP%\\prana-scratch. "
+                            "Defaults to permanent."
+                        ),
+                    },
                 },
                 "required": ["action"],
                 "additionalProperties": False,
@@ -87,15 +96,15 @@ def _validate_ref(value: object) -> str | None:
 
 def validate_git_arguments(
     arguments: object,
-) -> tuple[str, int, str | None, str | None]:
+) -> tuple[str, int, str | None, str | None, str]:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"action", "limit", "path", "ref"}
+        {"action", "limit", "path", "ref", "workspace"}
     ):
         raise ValueError("Git 读取 skill 参数无效。")
     action = arguments.get("action")
     if action not in {"status", "log", "diff", "branch"}:
         raise ValueError("action 只能是 status、log、diff 或 branch。")
-    allowed_keys = {"action"}
+    allowed_keys = {"action", "workspace"}
     if action == "log":
         allowed_keys.add("limit")
     if action == "diff":
@@ -105,7 +114,10 @@ def validate_git_arguments(
     limit = _validate_limit(arguments.get("limit", 10))
     path = validate_workspace_path(arguments.get("path"))
     ref = _validate_ref(arguments.get("ref"))
-    return action, limit, path, ref
+    workspace = arguments.get("workspace", "permanent")
+    if workspace not in {"permanent", "scratch"}:
+        raise ValueError("workspace 只能是 permanent 或 scratch。")
+    return action, limit, path, ref, workspace
 
 
 def _run_git(
@@ -178,7 +190,9 @@ def invoke_git_skill(
     *,
     workspace_root: Path | None = None,
 ) -> str:
-    action, limit, path, ref = validate_git_arguments(arguments)
+    action, limit, path, ref, workspace = validate_git_arguments(arguments)
+    if workspace == "scratch":
+        raise ValueError("Git 仅在永久工作区可用。")
     root = (workspace_root or default_workspace_root()).resolve()
     if not root.is_dir():
         raise ValueError("工作目录不存在或不是目录。")

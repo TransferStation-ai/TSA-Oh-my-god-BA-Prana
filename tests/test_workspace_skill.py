@@ -398,5 +398,17 @@ def test_scratch_workspace_root_is_under_temp(tmp_path):
     assert root == Path(tempfile.gettempdir()) / "prana-scratch"
 
 
+def test_write_workspace_file_rejects_bad_workspace(tmp_path):
+    import pytest
+    from skills.workspace import invoke_workspace_skill
+
+    with pytest.raises(ValueError):
+        invoke_workspace_skill(
+            "write_workspace_file",
+            {"path": "a.txt", "content": "x", "workspace": "other"},
+            workspace_root=tmp_path,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
