@@ -47,6 +47,18 @@ def message_weight(message: dict[str, Any]) -> int:
     return len(str(content))
 
 
+def _group_into_turns(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    turns: list[list[dict[str, Any]]] = []
+    for message in messages:
+        if message.get("role") == "user":
+            turns.append([message])
+        elif turns:
+            turns[-1].append(message)
+        else:
+            turns.append([message])
+    return turns
+
+
 def trim_history(
     messages: list[dict[str, Any]],
     *,
@@ -64,21 +76,32 @@ def trim_history(
     if not conversation:
         return system_messages
 
+    turns = _group_into_turns(conversation)
     allowed_count = max(1, max_messages - len(system_messages))
-    kept = [conversation[-1]]
-    total = message_weight(conversation[-1])
-    for message in reversed(conversation[:-1]):
-        if len(kept) >= allowed_count:
+    max_keepable = sum(len(turn) for turn in turns)
+    kept_turns: list[list[dict[str, Any]]] = []
+    kept_count = 0
+    total = 0
+    for turn in reversed(turns):
+        turn_count = len(turn)
+        if kept_count + turn_count > allowed_count:
+            if kept_turns:
+                break
+            kept_turns.insert(0, turn)
+            kept_count += turn_count
+            total += sum(message_weight(message) for message in turn)
             break
-        weight = message_weight(message)
-        if total + weight > max_chars:
+        turn_weight = sum(message_weight(message) for message in turn)
+        if total + turn_weight > max_chars and kept_turns:
             break
-        kept.append(message)
-        total += weight
-    kept.reverse()
-    while len(kept) > 1 and kept[0].get("role") != "user":
-        kept.pop(0)
-    return system_messages + kept
+        kept_turns.insert(0, turn)
+        kept_count += turn_count
+        total += turn_weight
+    if not kept_turns:
+        kept_turns = [turns[-1]]
+    return system_messages + [
+        message for turn in kept_turns for message in turn
+    ]
 
 
 def insert_assistant_messages(
