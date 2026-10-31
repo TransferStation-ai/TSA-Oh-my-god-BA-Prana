@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from ai_client import AIClient
 
@@ -74,12 +74,132 @@ class FakeDesktopAccess:
         return self.stop
 
 
+class ToolExchangeRecorderTests(unittest.TestCase):
+    def test_tool_exchange_recorder_is_called_with_assistant_and_results(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        tool_call = {
+            "id": "call-time",
+            "type": "function",
+            "function": {
+                "name": "get_system_time",
+                "arguments": json.dumps({}),
+            },
+        }
+        assistant_tool_call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [tool_call],
+        }
+        exchanges: list[tuple[dict, list]] = []
+
+        def record(assistant_message, tool_results):
+            exchanges.append((assistant_message, tool_results))
+
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                assistant_tool_call,
+                {"role": "assistant", "content": "现在是 20:00。"},
+            ],
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [
+                    {"role": "user", "content": "现在几点"},
+                ],
+                tool_exchange_recorder=record,
+            )
+
+        self.assertEqual(reply, "现在是 20:00。")
+        self.assertEqual(len(exchanges), 1)
+        recorded_assistant, recorded_results = exchanges[0]
+        self.assertEqual(recorded_assistant["role"], "assistant")
+        self.assertIsNone(recorded_assistant.get("content"))
+        self.assertEqual(recorded_assistant["tool_calls"], [tool_call])
+        self.assertEqual(len(recorded_results), 1)
+        self.assertEqual(recorded_results[0]["role"], "tool")
+        self.assertEqual(recorded_results[0]["tool_call_id"], "call-time")
+
+    def test_tool_exchange_recorder_is_called_for_multiple_rounds(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+
+        def make_call(call_id):
+            return {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "get_system_time",
+                    "arguments": json.dumps({}),
+                },
+            }
+
+        exchanges: list[tuple[dict, list]] = []
+
+        def record(assistant_message, tool_results):
+            exchanges.append((assistant_message, tool_results))
+
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {"role": "assistant", "content": None, "tool_calls": [make_call("c1")]},
+                {"role": "assistant", "content": None, "tool_calls": [make_call("c2")]},
+                {"role": "assistant", "content": "完成"},
+            ],
+        ):
+            client.complete_with_media_skills(
+                [{"role": "user", "content": "现在几点"}],
+                tool_exchange_recorder=record,
+            )
+
+        self.assertEqual(len(exchanges), 2)
+        self.assertEqual(
+            [result["tool_call_id"] for _, results in exchanges for result in results],
+            ["c1", "c2"],
+        )
+
+    def test_tool_exchange_recorder_not_called_without_tool_calls(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        exchanges: list[tuple[dict, list]] = []
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[{"role": "assistant", "content": "你好"}],
+        ):
+            client.complete_with_media_skills(
+                [{"role": "user", "content": "你好"}],
+                tool_exchange_recorder=lambda a, r: exchanges.append((a, r)),
+            )
+        self.assertEqual(exchanges, [])
+
+
 class AIClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings_patch = patch(
             "ai_client.settings_store.load_settings", return_value={}
         )
         self.settings_patch.start()
+        sleep_patch = patch("ai_client.time.sleep")
+        sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
 
     def tearDown(self) -> None:
         self.settings_patch.stop()
@@ -120,13 +240,66 @@ class AIClientTests(unittest.TestCase):
                 RuntimeError("temporarily unavailable"),
                 {"role": "assistant", "content": "已收到"},
             ],
-        ) as complete_once:
+        ) as complete_once, patch(
+            "ai_client.time.sleep", return_value=None
+        ) as sleep:
             response = client._complete_message(
                 [{"role": "user", "content": "你好"}]
             )
 
         self.assertEqual(response["content"], "已收到")
         self.assertEqual(complete_once.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [call(5)])
+
+    def test_chat_request_retries_rate_limit_error_with_increasing_delays(
+        self
+    ) -> None:
+        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True):
+            client = AIClient()
+        rate_limit_error = RuntimeError(
+            "AI 服务返回 HTTP 429: You've reached the API rate limit for free users. "
+            "Upgrade to a Token Plan to unlimit."
+        )
+        with patch.object(
+            client,
+            "_complete_message_once",
+            side_effect=[
+                rate_limit_error,
+                rate_limit_error,
+                rate_limit_error,
+                {"role": "assistant", "content": "已收到"},
+            ],
+        ) as complete_once, patch(
+            "ai_client.time.sleep", return_value=None
+        ) as sleep:
+            response = client._complete_message(
+                [{"role": "user", "content": "你好"}]
+            )
+
+        self.assertEqual(response["content"], "已收到")
+        self.assertEqual(complete_once.call_count, 4)
+        self.assertEqual(sleep.call_args_list, [call(5), call(10), call(15)])
+
+    def test_chat_request_reports_error_after_retries_exhausted(self) -> None:
+        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True):
+            client = AIClient()
+        rate_limit_error = RuntimeError(
+            "AI 服务返回 HTTP 429: You've reached the API rate limit for free users."
+        )
+        with patch.object(
+            client,
+            "_complete_message_once",
+            side_effect=rate_limit_error,
+        ) as complete_once, patch(
+            "ai_client.time.sleep", return_value=None
+        ) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "rate limit"):
+                client._complete_message(
+                    [{"role": "user", "content": "你好"}]
+                )
+
+        self.assertEqual(complete_once.call_count, 4)
+        self.assertEqual(sleep.call_args_list, [call(5), call(10), call(15)])
 
     def test_chat_request_reports_error_after_retry_fails(self) -> None:
         with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True):
@@ -135,13 +308,15 @@ class AIClientTests(unittest.TestCase):
             client,
             "_complete_message_once",
             side_effect=RuntimeError("service unavailable"),
-        ) as complete_once:
+        ) as complete_once, patch(
+            "ai_client.time.sleep", return_value=None
+        ):
             with self.assertRaisesRegex(RuntimeError, "service unavailable"):
                 client._complete_message(
                     [{"role": "user", "content": "你好"}]
                 )
 
-        self.assertEqual(complete_once.call_count, 2)
+        self.assertEqual(complete_once.call_count, 4)
 
     def test_save_configuration_persists_and_updates_client(self) -> None:
         with patch("ai_client.settings_store.load_settings", return_value={}), patch(
@@ -668,7 +843,12 @@ class AIClientTests(unittest.TestCase):
                 "run_terminal_command",
                 "get_project_structure",
                 "search_workspace_files",
+                "write_workspace_file",
+                "edit_workspace_file",
+                "transfer_workspace_file",
+                "switch_workspace",
                 "read_git_repository",
+                "run_shell_command",
             ],
         )
         self.assertEqual(
@@ -931,7 +1111,9 @@ class AIClientTests(unittest.TestCase):
             "type": "function",
             "function": {"name": "send_image"},
         }
-        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True), patch(
+        with patch.dict(os.environ, {
+            "PRANA_API_KEY": "test-key", "PRANA_API_BASE_URL": "https://example.test/v1",
+        }, clear=True), patch(
             "ai_client.urllib.request.urlopen",
             return_value=FakeResponse(
                 {"choices": [{"message": {"role": "assistant", "content": None}}]}
@@ -1141,7 +1323,9 @@ class AIClientTests(unittest.TestCase):
         self.assertEqual(
             review_payload["proposed_operation"]["arguments"], arguments
         )
-        invoke.assert_called_once_with("search_workspace_files", arguments)
+        invoke.assert_called_once_with(
+            "search_workspace_files", arguments, workspace_root=None
+        )
         tool_message = complete_message.call_args_list[1].args[0][-1]
         self.assertIn("main.py", tool_message["content"])
 
@@ -1189,7 +1373,9 @@ class AIClientTests(unittest.TestCase):
 
         self.assertEqual(reply, "Git 状态已读取。")
         self.assertEqual(media, [])
-        invoke.assert_called_once_with(arguments)
+        invoke.assert_called_once_with(
+            arguments, workspace_root=None
+        )
         tool_message = complete_message.call_args_list[1].args[0][-1]
         self.assertIn("M app.py", tool_message["content"])
 
@@ -1678,7 +1864,9 @@ class AIClientTests(unittest.TestCase):
             client.complete([{"role": "user", "content": "你好"}])
 
     def test_complete_rejects_empty_reply(self) -> None:
-        with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True), patch(
+        with patch.dict(os.environ, {
+            "PRANA_API_KEY": "test-key", "PRANA_API_BASE_URL": "https://example.test/v1",
+        }, clear=True), patch(
             "ai_client.urllib.request.urlopen",
             return_value=FakeResponse(
                 {"choices": [{"message": {"content": "  "}}]}
@@ -1819,6 +2007,92 @@ class AIClientTests(unittest.TestCase):
                 ("https://example.test/images/cat.png", "A cat"),
             ],
         )
+
+    def test_bilibili_extract_video_id_preserves_case(self) -> None:
+        self.assertEqual(
+            AIClient._extract_bilibili_video_id(
+                "https://www.bilibili.com/video/BV1GJ411x7h7"
+            ),
+            "BV1GJ411x7h7",
+        )
+        self.assertEqual(
+            AIClient._extract_bilibili_video_id(
+                "https://m.bilibili.com/short-video/BV1GJ411x7h7"
+            ),
+            "BV1GJ411x7h7",
+        )
+
+    def test_bilibili_extract_av_id_preserves_case(self) -> None:
+        self.assertEqual(
+            AIClient._extract_bilibili_video_id(
+                "https://www.bilibili.com/video/av80433022"
+            ),
+            "av80433022",
+        )
+
+    def test_bilibili_extract_id_from_query_param(self) -> None:
+        self.assertEqual(
+            AIClient._extract_bilibili_video_id(
+                "https://www.bilibili.com/list?bvid=BV1GJ411x7h7"
+            ),
+            "BV1GJ411x7h7",
+        )
+
+    def test_bilibili_extract_non_video_url_returns_none(self) -> None:
+        self.assertIsNone(
+            AIClient._extract_bilibili_video_id(
+                "https://space.bilibili.com/486906719"
+            )
+        )
+
+    def test_bilibili_fetch_details_uses_original_case(self) -> None:
+        class FakeBiliResponse(FakeResponse):
+            def __init__(self) -> None:
+                super().__init__(
+                    {
+                        "code": 0,
+                        "data": {
+                            "title": "Rick Astley - Never Gonna Give You Up",
+                            "owner": {"name": "officialtest"},
+                            "desc": "-",
+                            "pic": "http://i1.hdslb.com/bfs/archive/cover.jpg",
+                        },
+                    }
+                )
+
+        opener = SimpleNamespace(open=lambda *_args, **_kwargs: FakeBiliResponse())
+        with patch("ai_client.urllib.request.build_opener", return_value=opener):
+            text, images = AIClient._fetch_bilibili_video_details(
+                "https://www.bilibili.com/video/BV1GJ411x7h7"
+            )
+        self.assertIsNotNone(text)
+        self.assertIn("Rick Astley", text)
+        self.assertIn("UP 主", text)
+        self.assertEqual(images, [("http://i1.hdslb.com/bfs/archive/cover.jpg", "Rick Astley - Never Gonna Give You Up")])
+
+    def test_bilibili_fetch_details_av_link(self) -> None:
+        class FakeBiliResponse(FakeResponse):
+            def __init__(self) -> None:
+                super().__init__(
+                    {
+                        "code": 0,
+                        "data": {
+                            "title": "av test",
+                            "owner": {"name": "up"},
+                            "desc": "d",
+                            "pic": "",
+                        },
+                    }
+                )
+
+        opener = SimpleNamespace(open=lambda *_args, **_kwargs: FakeBiliResponse())
+        with patch("ai_client.urllib.request.build_opener", return_value=opener):
+            text, images = AIClient._fetch_bilibili_video_details(
+                "https://www.bilibili.com/video/av80433022"
+            )
+        self.assertIsNotNone(text)
+        self.assertIn("av test", text)
+        self.assertEqual(images, [])
 
     def test_download_webpage_image_only_accepts_listed_urls(self) -> None:
         with patch.dict(os.environ, {"PRANA_API_KEY": "test-key"}, clear=True):
@@ -2374,6 +2648,65 @@ class AIClientTests(unittest.TestCase):
         invoke.assert_not_called()
         tool_message = complete_message.call_args_list[1].args[0][-1]
         self.assertIn("已停止桌面控制", tool_message["content"])
+
+    def test_screenshot_reply_removes_tool_ca_label_markup(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        access = FakeDesktopAccess(authorized=True)
+        call = self._desktop_tool_call(
+            "call-shot", "control_desktop", {"action": "screenshot"}
+        )
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "我看到当前画面了。\n"
+                            "<tool_ca>\n{\"action\": \"screenshot\"}\n"
+                            "</tool_ca>"
+                        ),
+                    },
+                ],
+            ) as complete_message,
+            patch(
+                "ai_client.invoke_desktop_skill",
+                return_value=(
+                    '{"status":"captured","width":800,"height":600}',
+                    b"\xff\xd8jpeg",
+                ),
+            ),
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "看看屏幕"}],
+                desktop_access=access,
+            )
+
+        self.assertEqual(reply, "我看到当前画面了。")
+        second_messages = complete_message.call_args_list[1].args[0]
+        self.assertNotIn(
+            "<tool_ca>",
+            json.dumps(second_messages, ensure_ascii=False),
+        )
+
+
+def test_shell_skills_imported_by_ai_client():
+    import ai_client
+    assert hasattr(ai_client, "SHELL_SKILLS")
+    names = [tool["function"]["name"] for tool in ai_client.SHELL_SKILLS]
+    assert "run_shell_command" in names
 
 
 if __name__ == "__main__":
