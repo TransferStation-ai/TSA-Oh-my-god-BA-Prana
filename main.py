@@ -2083,6 +2083,7 @@ class PranaApp:
         self._render_active_session()
         self._update_pending_status()
         self._refresh_desktop_indicator()
+        self._refresh_workspace_indicator()
 
     def _reload_active_session(self) -> None:
         if self.active_session_id is None:
@@ -2093,16 +2094,24 @@ class PranaApp:
             )
         except RuntimeError:
             return
+        self._refresh_workspace_indicator()
 
-    def _active_permanent_root(self) -> Path | None:
-        """返回当前会话激活的永久工作区根；None 表示用默认应用目录。"""
-        pw = self.active_session.get("permanent_workspace")
+    @staticmethod
+    def _permanent_root_from_session(
+        session: dict[str, object],
+    ) -> Path | None:
+        """从会话元数据解析激活的永久工作区；None 表示用默认应用目录。"""
+        pw = session.get("permanent_workspace")
         if not isinstance(pw, str) or not pw.strip():
             return None
         candidate = Path(pw).expanduser().resolve()
         if not candidate.is_dir():
             return None
         return candidate
+
+    def _active_permanent_root(self) -> Path | None:
+        """返回当前会话激活的永久工作区根；None 表示用默认应用目录。"""
+        return self._permanent_root_from_session(self.active_session)
 
     def _create_session(self) -> dict[str, object]:
         session = self.session_store.new_session(
@@ -3616,6 +3625,37 @@ class PranaApp:
                 )
             desktop_access = _DesktopAccessAdapter(self, request)
 
+            workspace_root_holder: list[Path | None] = [
+                self._permanent_root_from_session(session)
+            ]
+
+            def workspace_root_provider() -> Path | None:
+                return workspace_root_holder[0]
+
+            def on_workspace_switched(path: str) -> None:
+                try:
+                    resolved = Path(path).expanduser().resolve()
+                except (OSError, RuntimeError):
+                    resolved = None
+                if resolved is not None:
+                    workspace_root_holder[0] = resolved
+                try:
+                    self.session_store.update(
+                        request.session_id,
+                        lambda current: current.__setitem__(
+                            "permanent_workspace", path
+                        ),
+                    )
+                except (RuntimeError, ValueError):
+                    pass
+
+                def refresh_indicator() -> None:
+                    if self.active_session_id == request.session_id:
+                        self._reload_active_session()
+                        self._refresh_workspace_indicator()
+
+                self._post_to_ui(refresh_indicator)
+
             reply, generated_media = (
                 self.ai_client.complete_with_media_skills(
                     messages,
@@ -3627,6 +3667,10 @@ class PranaApp:
                     message_sender=send_chat_message,
                     brainstorm_runner=brainstorm_runner,
                     desktop_access=desktop_access,
+                    permanent_root=workspace_root_holder[0],
+                    permanent_root_provider=workspace_root_provider,
+                    on_workspace_switched=on_workspace_switched,
+                    should_stop=request.cancel_event.is_set,
                     tool_exchange_recorder=record_tool_exchange,
                 )
             )

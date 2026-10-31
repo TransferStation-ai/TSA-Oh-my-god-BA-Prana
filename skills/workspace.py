@@ -685,9 +685,8 @@ def _resolve_workspace_file(
     return resolved_root, target
 
 
-def _atomic_write_text(target: Path, content: str) -> int:
+def _atomic_write_bytes(target: Path, data: bytes) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
-    data = content.encode("utf-8")
     with tempfile.NamedTemporaryFile(
         dir=target.parent, delete=False, suffix=".tmp", prefix=".write-"
     ) as handle:
@@ -699,6 +698,10 @@ def _atomic_write_text(target: Path, content: str) -> int:
         temporary_path.unlink(missing_ok=True)
         raise
     return len(data)
+
+
+def _atomic_write_text(target: Path, content: str) -> int:
+    return _atomic_write_bytes(target, content.encode("utf-8"))
 
 
 def _write_workspace_file(root: Path, arguments: object) -> str:
@@ -768,7 +771,7 @@ def _transfer_workspace_file(
             f"目标已存在：{target_path}。如需覆盖请设 overwrite=true。"
         )
     data = source.read_bytes()
-    _atomic_write_text(target, data.decode("utf-8", "replace"))
+    _atomic_write_bytes(target, data)
     return json.dumps(
         {
             "from": f"{source_workspace}:{source_path}",

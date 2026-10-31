@@ -3,6 +3,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 MAX_TERMINAL_OUTPUT_LENGTH = 20000
 MAX_TERMINAL_FILE_BYTES = 64 * 1024
@@ -348,11 +349,19 @@ def validate_shell_command(arguments: object) -> None:
         raise ValueError("workspace 只能是 permanent 或 scratch。")
 
 
+def _terminate_process(process) -> None:
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def invoke_shell_skill(
     arguments: object,
     *,
     permanent_root: Path | None = None,
     scratch_root: Path | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> str:
     validate_shell_command(arguments)
     from skills.workspace import resolve_workspace_root
@@ -375,29 +384,48 @@ def invoke_shell_skill(
 
     import os
     import subprocess
+    import time
 
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NoLogo", "-Command", command],
-            cwd=target,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            creationflags=(
-                subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            ),
-        )
-        timed_out = False
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        exit_code = result.returncode
-    except subprocess.TimeoutExpired as error:
-        timed_out = True
-        stdout = error.stdout or "" if error.stdout else ""
-        stderr = error.stderr or "" if error.stderr else ""
-        exit_code = -1
+    process = subprocess.Popen(
+        ["powershell", "-NoProfile", "-NoLogo", "-Command", command],
+        cwd=target,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=(
+            subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        ),
+    )
+    timed_out = False
+    canceled = False
+    deadline = time.monotonic() + timeout
+    stdout = ""
+    stderr = ""
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            if should_stop is not None and should_stop():
+                canceled = True
+                _terminate_process(process)
+                stdout, stderr = process.communicate()
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate_process(process)
+                stdout, stderr = process.communicate()
+                break
+            continue
+        break
+    stdout = stdout or ""
+    stderr = stderr or ""
+    exit_code = (
+        process.returncode
+        if process.returncode is not None and not (timed_out or canceled)
+        else -1
+    )
 
     stdout_b = stdout.encode("utf-8", "replace")[:MAX_SHELL_OUTPUT_BYTES]
     stderr_b = stderr.encode("utf-8", "replace")[:MAX_SHELL_OUTPUT_BYTES]
@@ -411,6 +439,7 @@ def invoke_shell_skill(
             "stdout": stdout_b.decode("utf-8", "replace"),
             "stderr": stderr_b.decode("utf-8", "replace"),
             "timed_out": timed_out,
+            "canceled": canceled,
             "truncated": truncated,
             "workspace": workspace,
         },
