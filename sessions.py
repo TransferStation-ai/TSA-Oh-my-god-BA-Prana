@@ -5,10 +5,12 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Callable
 
 import settings_store
+from responses_adapter import RESPONSES_METADATA, valid_metadata
 
 SESSION_VERSION = 1
 SESSION_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
@@ -74,8 +76,12 @@ def new_message(
     kind: str = "text",
     brainstorm_session_id: str | None = None,
     retry_user_message_id: str | None = None,
+    tool_calls: list[dict[str, object]] | None = None,
+    tool_results: list[dict[str, object]] | None = None,
+    tool_call_id: str | None = None,
+    responses_metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    message = {
         "id": new_id(),
         "role": role,
         "content": content,
@@ -93,8 +99,14 @@ def new_message(
         "kind": kind,
         "brainstorm_session_id": brainstorm_session_id,
         "retry_user_message_id": retry_user_message_id,
+        "tool_calls": tool_calls,
+        "tool_results": tool_results,
+        "tool_call_id": tool_call_id,
         "created_at": time.time(),
     }
+    if responses_metadata is not None:
+        message[RESPONSES_METADATA] = deepcopy(responses_metadata)
+    return message
 
 
 def build_api_messages(
@@ -110,11 +122,19 @@ def build_api_messages(
         if not isinstance(message, dict) or not message.get("in_api", True):
             continue
         role = message.get("role")
-        if role not in {"system", "user", "assistant"}:
+        if role not in {"system", "developer", "user", "assistant", "tool"}:
             continue
         if system_prompt and role == "system":
             continue
-        messages.append({"role": role, "content": message.get("content")})
+        api_message = {"role": role, "content": message.get("content")}
+        if role == "assistant":
+            if message.get("tool_calls"):
+                api_message["tool_calls"] = deepcopy(message["tool_calls"])
+            if RESPONSES_METADATA in message:
+                api_message[RESPONSES_METADATA] = deepcopy(message[RESPONSES_METADATA])
+        elif role == "tool":
+            api_message["tool_call_id"] = message.get("tool_call_id")
+        messages.append(api_message)
     return messages
 
 
@@ -136,6 +156,7 @@ class SessionStore:
         title: str = "",
         agent: str = "",
         brainstorm: dict[str, object] | None = None,
+        permanent_workspace: str | None = None,
     ) -> dict[str, object]:
         if kind not in SESSION_KINDS:
             raise ValueError("会话类型无效。")
@@ -154,6 +175,7 @@ class SessionStore:
             "updated_at": now,
             "messages": [],
             "brainstorm": brainstorm,
+            "permanent_workspace": permanent_workspace,
         }
 
     def load(self, session_id: str) -> dict[str, object]:
@@ -338,6 +360,9 @@ class SessionStore:
             raise ValueError("会话标题格式无效。")
         if not isinstance(session.get("agent"), str):
             raise ValueError("会话代理格式无效。")
+        pw = session.get("permanent_workspace")
+        if pw is not None and not isinstance(pw, str):
+            raise ValueError("会话字段 permanent_workspace 无效。")
         for field in ("created_at", "updated_at"):
             value = session.get(field)
             if isinstance(value, bool) or not isinstance(
@@ -366,11 +391,33 @@ class SessionStore:
                 raise ValueError("消息格式无效。")
             if not is_valid_session_id(message.get("id")):
                 raise ValueError("消息 id 无效。")
-            if message.get("role") not in {"system", "user", "assistant"}:
+            if message.get("role") not in {"system", "developer", "user", "assistant", "tool"}:
                 raise ValueError("消息角色无效。")
+            if message.get("role") == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    raise ValueError("工具结果消息缺少 tool_call_id。")
+            tool_calls = message.get("tool_calls")
+            if tool_calls is not None:
+                if not isinstance(tool_calls, list):
+                    raise ValueError("工具调用列表格式无效。")
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        raise ValueError("工具调用项格式无效。")
+                    if not isinstance(call.get("id"), str) or not call.get("id"):
+                        raise ValueError("工具调用缺少 id。")
             if message.get("kind") not in MESSAGE_KINDS:
                 raise ValueError("消息类型无效。")
-            if not isinstance(message.get("content"), (str, list)):
+            if RESPONSES_METADATA in message and (
+                message.get("role") != "assistant"
+                or not valid_metadata(message[RESPONSES_METADATA])
+            ):
+                raise ValueError("消息 Responses 元数据格式无效。")
+            if not isinstance(message.get("content"), (str, list)) and not (
+                message.get("role") == "assistant"
+                and message.get("content") is None
+                and tool_calls
+            ):
                 raise ValueError("消息内容格式无效。")
             if not isinstance(message.get("display"), str):
                 raise ValueError("消息显示文本格式无效。")
