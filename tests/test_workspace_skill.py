@@ -402,7 +402,7 @@ def test_write_workspace_file_rejects_bad_workspace(tmp_path):
     import pytest
     from skills.workspace import invoke_workspace_skill
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="workspace 只能是 permanent 或 scratch。"):
         invoke_workspace_skill(
             "write_workspace_file",
             {"path": "a.txt", "content": "x", "workspace": "other"},
