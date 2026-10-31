@@ -108,6 +108,13 @@ def _safe_error_reason(data: dict[str, object]) -> str:
         if isinstance(error, dict):
             reason = _first_str(error.get("message"), error.get("code")) or ""
     if not reason:
+        # error / response.incomplete 事件的顶层 error 载荷（dict 或 str）。
+        error = data.get("error")
+        if isinstance(error, str) and error:
+            reason = error
+        elif isinstance(error, dict):
+            reason = _first_str(error.get("message"), error.get("code")) or ""
+    if not reason:
         reason = _first_str(data.get("message")) or ""
     return reason or "未知错误"
 
@@ -141,17 +148,19 @@ class ChatStream:
         if not isinstance(delta, dict):
             return events
 
-        content = delta.get("content")
-        if isinstance(content, str) and content:
-            self.content += content
-            events.append(("content", content))
-
+        # 设计固定 reasoning → content 的发射顺序：
+        # content 先到会触发 UI 思考块折叠，随后到达的 reasoning 将被折叠丢失。
         reasoning = _first_str(
             delta.get("reasoning_content"), delta.get("reasoning"), delta.get("thinking"),
         )
         if reasoning is not None:
             self.reasoning += reasoning
             events.append(("reasoning", reasoning))
+
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            self.content += content
+            events.append(("content", content))
 
         tool_calls = delta.get("tool_calls")
         if isinstance(tool_calls, list):

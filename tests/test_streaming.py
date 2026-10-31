@@ -81,6 +81,17 @@ class ChatStreamTests(unittest.TestCase):
             events = stream.feed({"choices": [{"delta": {field: "想"}}]})
             self.assertEqual(events, [("reasoning", "想")])
 
+    def test_combined_delta_emits_reasoning_before_content(self) -> None:
+        # 设计固定 reasoning → content 发射顺序：同一 delta 含两字段时，
+        # content 先触发 UI 思考块折叠会把随后到达的 reasoning 丢失。
+        stream = ChatStream()
+        events = stream.feed({"choices": [{"delta": {
+            "reasoning_content": "想法", "content": "答案",
+        }}]})
+        self.assertEqual(events, [("reasoning", "想法"), ("content", "答案")])
+        self.assertEqual(stream.reasoning, "想法")
+        self.assertEqual(stream.content, "答案")
+
 
 class ResponsesStreamTests(unittest.TestCase):
     def test_deltas_and_final_payload(self) -> None:
@@ -96,6 +107,18 @@ class ResponsesStreamTests(unittest.TestCase):
         stream = ResponsesStream()
         with self.assertRaises(RuntimeError):
             stream.feed("response.failed", {"response": {"error": {"message": "boom"}}})
+
+    def test_top_level_error_payload_becomes_reason(self) -> None:
+        # error / response.incomplete 事件常见载荷：顶层 error（dict 或 str）。
+        with self.assertRaises(RuntimeError) as ctx:
+            ResponsesStream().feed("error", {"error": {"message": "配额不足"}})
+        self.assertEqual(str(ctx.exception), "AI 服务流式响应失败：配额不足")
+        with self.assertRaises(RuntimeError) as ctx:
+            ResponsesStream().feed("response.incomplete", {"error": "上游中断"})
+        self.assertEqual(str(ctx.exception), "AI 服务流式响应失败：上游中断")
+        with self.assertRaises(RuntimeError) as ctx:
+            ResponsesStream().feed("error", {"error": {"code": "rate_limited"}})
+        self.assertEqual(str(ctx.exception), "AI 服务流式响应失败：rate_limited")
 
 
 class ReasoningExtractionTests(unittest.TestCase):
