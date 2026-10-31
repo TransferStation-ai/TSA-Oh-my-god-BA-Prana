@@ -646,6 +646,22 @@ def _edit_workspace_file(root: Path, arguments: object) -> str:
     )
 
 
+def resolve_workspace_root(
+    workspace: str,
+    permanent_root: Path | None = None,
+    scratch_root: Path | None = None,
+) -> Path:
+    if workspace not in {"permanent", "scratch"}:
+        raise ValueError("workspace 只能是 permanent 或 scratch。")
+    if workspace == "scratch":
+        root = (scratch_root or scratch_workspace_root()).resolve()
+    else:
+        root = (permanent_root or default_workspace_root()).resolve()
+    if not root.is_dir():
+        raise ValueError("工作目录不存在或不是目录。")
+    return root
+
+
 def invoke_workspace_skill(
     name: str,
     arguments: object,
