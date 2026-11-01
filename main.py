@@ -3730,6 +3730,7 @@ class PranaApp:
                 )
             )
             return
+        view: _StreamView | None = None
         try:
             user_content, webpage_images = (
                 self.ai_client.create_user_content_with_webpage_images(
@@ -3878,11 +3879,18 @@ class PranaApp:
                 ):
                     return
             fallback_reply = None
+            if view is not None:
+                self._post_to_ui(
+                    lambda current=view: self._commit_partial_stream(current)
+                )
+            fallback_view = self._new_stream_view(request)
             try:
                 fallback_reply = (
                     self.ai_client.complete_with_failure_fallback(
                         messages,
                         failure_reason=str(error),
+                        on_event=self._stream_event_callback(fallback_view),
+                        should_stop=request.cancel_event.is_set,
                     )
                 )
             except Exception as fallback_error:
@@ -4026,6 +4034,52 @@ class PranaApp:
             if streaming.should_follow(self.canvas.yview()[1]):
                 self.root.after_idle(lambda: self.canvas.yview_moveto(1.0))
 
+    def _finalize_stream(
+        self, view: _StreamView
+    ) -> tuple[str, list[dict[str, object]]]:
+        if view.finalized:
+            return view.state.content, list(view.state.blocks)
+        view.finalized = True
+        events, _closed = view.buffer.drain()
+        for kind, text, timestamp in events:
+            for action, payload in view.state.apply(kind, text, timestamp):
+                self._apply_stream_action(view, action, payload)
+        for action, payload in view.state.finish(time.monotonic()):
+            self._apply_stream_action(view, action, payload)
+        with self.state_lock:
+            if self.stream_views.get(view.request_id) is view:
+                self.stream_views.pop(view.request_id, None)
+        if view.row is not None:
+            view.row.destroy()
+            view.row = None
+        return view.state.content, list(view.state.blocks)
+
+    def _commit_partial_stream(self, view: _StreamView) -> None:
+        if view.finalized:
+            return
+        display, blocks = self._finalize_stream(view)
+        if not display:
+            return
+        record = new_message(
+            "assistant",
+            display,
+            display=display,
+            reasoning_blocks=blocks or None,
+            visible=True,
+            in_api=False,
+        )
+        self._append_session_message(
+            view.session_id,
+            record,
+            after_user_message_id=view.user_message_id,
+        )
+        if self.active_session_id == view.session_id:
+            self._add_message(
+                "assistant",
+                display,
+                reasoning_blocks=blocks or None,
+            )
+
     def _handle_reply(
         self,
         request: ChatRequest,
@@ -4055,8 +4109,13 @@ class PranaApp:
             except (RuntimeError, ValueError):
                 pass
 
+        with self.state_lock:
+            view = self.stream_views.get(request.request_id)
+        display, blocks = (
+            self._finalize_stream(view) if view is not None else ("", [])
+        )
         active = self.active_session_id == request.session_id
-        if error is not None:
+        if error is not None and not display:
             record = new_message(
                 "assistant",
                 "",
@@ -4082,11 +4141,13 @@ class PranaApp:
                     ),
                 )
         elif reply is not None and reply.strip():
+            final_display = display or reply
             record = new_message(
                 "assistant",
                 reply,
-                display=reply,
+                display=final_display,
                 media_paths=generated_media,
+                reasoning_blocks=blocks or None,
             )
             self._append_session_message(
                 request.session_id,
@@ -4096,8 +4157,28 @@ class PranaApp:
             if active:
                 self._add_message(
                     "assistant",
-                    reply,
+                    final_display,
                     media_paths=generated_media,
+                    reasoning_blocks=blocks or None,
+                )
+        elif display:
+            record = new_message(
+                "assistant",
+                "",
+                display=display,
+                reasoning_blocks=blocks or None,
+                in_api=False,
+            )
+            self._append_session_message(
+                request.session_id,
+                record,
+                after_user_message_id=request.user_message_id,
+            )
+            if active:
+                self._add_message(
+                    "assistant",
+                    display,
+                    reasoning_blocks=blocks or None,
                 )
         elif generated_media:
             record = new_message(
@@ -4232,6 +4313,33 @@ class PranaApp:
             return
         pending = self._cancel_session_requests(self.active_session_id)
         for request in pending:
+            with self.state_lock:
+                view = self.stream_views.get(request.request_id)
+            display, blocks = (
+                self._finalize_stream(view)
+                if view is not None
+                else ("", [])
+            )
+            if display:
+                partial = new_message(
+                    "assistant",
+                    display,
+                    display=display,
+                    reasoning_blocks=blocks or None,
+                    visible=True,
+                    in_api=False,
+                )
+                self._append_session_message(
+                    request.session_id,
+                    partial,
+                    after_user_message_id=request.user_message_id,
+                )
+                if self.active_session_id == request.session_id:
+                    self._add_message(
+                        "assistant",
+                        display,
+                        reasoning_blocks=blocks or None,
+                    )
             record = new_message(
                 "assistant",
                 STOPPED_MESSAGE,

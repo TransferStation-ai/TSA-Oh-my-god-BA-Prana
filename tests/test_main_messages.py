@@ -128,5 +128,78 @@ class ThinkingBlockTests(unittest.TestCase):
         self.assertFalse(view.finalized)
 
 
+class StreamFinalizeTests(unittest.TestCase):
+    def _build_app(self, view):
+        import threading
+
+        app = object.__new__(main.PranaApp)
+        app.state_lock = threading.RLock()
+        app.stream_views = {view.request_id: view}
+        app.actions = []
+
+        def record(current, action, payload):
+            app.actions.append((action, payload))
+
+        app._apply_stream_action = record
+        return app
+
+    def test_finalize_stream_returns_content_and_blocks(self) -> None:
+        import streaming
+
+        view = main._StreamView(
+            7, "s", "u1", streaming.StreamBuffer(), streaming.StreamState()
+        )
+        view.buffer.push("reasoning", "先想想")
+        view.buffer.push("content", "答案")
+        app = self._build_app(view)
+
+        display, blocks = app._finalize_stream(view)
+
+        self.assertEqual(display, "答案")
+        self.assertEqual([block["text"] for block in blocks], ["先想想"])
+        self.assertIsInstance(blocks[0]["seconds"], float)
+        self.assertTrue(view.finalized)
+        self.assertNotIn(7, app.stream_views)
+        self.assertIn(("content", "答案"), app.actions)
+
+    def test_finalize_stream_is_idempotent(self) -> None:
+        import streaming
+
+        view = main._StreamView(
+            8, "s", "u1", streaming.StreamBuffer(), streaming.StreamState()
+        )
+        view.buffer.push("content", "答案")
+        app = self._build_app(view)
+
+        first = app._finalize_stream(view)
+        second = app._finalize_stream(view)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(app.actions), 1)
+
+    def test_commit_partial_stream_skips_empty_display(self) -> None:
+        import streaming
+
+        view = main._StreamView(
+            9, "s", "u1", streaming.StreamBuffer(), streaming.StreamState()
+        )
+        app = self._build_app(view)
+        app.appended = []
+
+        def append(session_id, record, *, after_user_message_id=None):
+            app.appended.append((session_id, record))
+
+        app._append_session_message = append
+        app.active_session_id = "s"
+        app._add_message = lambda *args, **kwargs: self.fail(
+            "empty stream should not render"
+        )
+
+        app._commit_partial_stream(view)
+
+        self.assertEqual(app.appended, [])
+        self.assertTrue(view.finalized)
+
+
 if __name__ == "__main__":
     unittest.main()
