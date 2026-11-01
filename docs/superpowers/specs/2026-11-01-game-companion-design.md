@@ -78,13 +78,14 @@
   - 指令：`connect(host, port, name, skinBase64)` / `disconnect` / `follow(name)` / `say(text)` / `msg(target, text)` / `status()`。
   - 事件：聊天（公屏 + 私聊）、位置、附近玩家、连接错误。
   - 皮肤：`普拉娜.png` 读入 base64 → `bot.applySkin`。默认游戏名 **`Prana`**（vanilla 玩家名只允许 `[a-zA-Z0-9_]`，中文不行；可在设置里改）。
+  - **EXE 交付形态**：Node 工程源文件打进 EXE 数据，首用解压到 `%LOCALAPPDATA%\Prana\mc_body\` 再 `npm ci`；开发形态直接用仓库目录。
   - 行为面（一期）：跟随（pathfinder）、说话、私聊、停止。破坏/放置方块**不进一期**（避免误拆老师的世界；三期再开放）。
 - EXE 不捆绑 Node：找不到系统 Node 时 Prana 明确回报"本机没有 Node.js，无法运行 MC 本体"。
 
 ### GMod 本体（二期）
 
 - **客户端**：启动 `gmod.exe`（自动探测 Steam 安装目录；连接参数形态见 spike S4），挂我们自己的 Lua。
-- **Lua 接入**：写 `garrysmod/gamemodes/gmod/includes/extensions/prana_agent.lua`（单文件、客户端 + 监听服双侧自动加载、可删除回退）：
+- **Lua 接入**：写 `garrysmod/gamemodes/gmod/includes/extensions/prana_agent.lua`（单文件、客户端 + 监听服双侧自动加载、可删除回退；**该挂载路径为初判，S2 以实测 GMod 客户端/监听服实际加载点为准，必要时换挂载点**）：
   - 监听服侧（= 本机老师的 gmod，同一安装目录）：给普拉娜玩家注册跟随/瞬移用的 server 命令。
   - 客户端侧：状态上报（位置、附近实体、chat 行）、执行 `say`、client 侧 `spawn`（摆道具）。
   - 远程专用服（老师给 IP）：服务端没我们的 addon → **降级**：只能 `say` + client spawn，不能跟随；回报时说明。
@@ -97,7 +98,8 @@
 ### 游戏大脑（两游戏共用的 LLM 循环）
 
 - 应用内线程：每游戏会话一个。
-- 输入：本体状态快照 + 最近事件（游戏内聊天、老师后台指令）+ 空闲心跳（≥4s 才允许再次调用模型，控费用）。
+- 输入：本体状态快照 + 最近事件（游戏内聊天、老师后台指令）。
+- **LLM 调用纯事件驱动**：本体静默时不调模型（零费用）；事件密集时按 ≥4s 间隔合并突发，控调用量与 token。
 - 系统提示词：普拉娜人格（复用现有 persona 段落裁剪版）+ 游戏规则 + 动作工具 schema（每游戏一套）+ "游戏内聊天即老师的输入"。
 - 动作工具：
   - MC：`mc_follow(name)` / `mc_say(text)` / `mc_msg(target,text)` / `mc_stop`
@@ -161,6 +163,8 @@
 
 - MC 会话内"破坏/放置方块"默认**不开放**（安全面），只留三期开关
 - 游戏会话卡片复用桌面控制的"指示器 + 撤销"交互范式
+- 大脑心跳语义（纯事件驱动、突发合并 4s）与 EXE 下 Node 服务落地目录（`%LOCALAPPDATA%\Prana\mc_body\`）
+- GMod Lua 挂载点以 S2 实测为准（初判 `includes/extensions`，若 gmod gamemode 不加载该目录则改用 autorun 钩子或独立 gamemode 壳）
 - Node 工程随仓库分发、首用 `npm ci`（不预装 node_modules）
 - GMod 探测端口段 `27015..27019`、MC 探测 `25565..25569`（各 5 个，局域网开世界实际只可能落在前几个）
 - 大脑调用用**主模型**，不新增"游戏专用模型"配置项
