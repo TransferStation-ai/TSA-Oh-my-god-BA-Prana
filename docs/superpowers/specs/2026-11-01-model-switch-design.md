@@ -1,7 +1,7 @@
 # 模型自由切换设计（opencode 式体验）
 
 日期：2026-11-01
-状态：草稿（建造者检查前）
+状态：草稿（建造者检查已完成，待用户确认）
 
 ## 意图与背景
 
@@ -61,7 +61,7 @@ Prana 目前的主模型切换体验：
 ```
 
 - **Vault key（provider_key）= 提供商粒度**（当前 3 个 preset 的 base_url 已互不相同，此粒度为防御性设计）：
-  - 内置 preset：`preset:<名称>`（同名两个 preset 各存各的 Key）
+  - 内置 preset：`preset:<名称>`（两个 preset 即使共用同一地址，也各存各的 Key）
   - 来自 opencode 链接的：`linked:<id>`（id 稳定）
   - 用户手填的自定义地址：`custom:<normalize_base_url(地址)>`
 - 旧 settings.json 没有该字段 → 按"空库"读；保存时**自动迁移**：把当前 `api_key/base_url/model` 写成一个 vault 条目（匹配内置 preset 则 `preset:`，否则 `custom:`）。只读旧文件永不报错。
@@ -72,7 +72,7 @@ Prana 目前的主模型切换体验：
 - `image_model / video_model / review_model` 存进 vault 条目。
 - 内置 preset 首次使用：填 preset 默认（沿用现有 `switching_provider` 时的预填行为）。
 - linked/custom：默认留空。
-- 切换主提供商时：取目标 vault 条目的值；**审查模型特殊处理**——审查请求固定发往主提供商端点（`_review_sensitive_operation` 用主 Key/地址 + review_model），若目标条目没有保存的 review_model，则**置空 = 回退为自审**（现状空 review_model 的既有行为），不沿用旧提供商的模型名（旧名字在新端点大概率 404）。
+- 切换主提供商时：取目标 vault 条目的值；**审查模型特殊处理**——审查请求固定发往主提供商端点（`_review_sensitive_operation` 用主 Key/地址 + review_model），目标条目没有保存的 review_model 时**置空**（不沿用旧提供商的模型名——旧名字在新端点大概率 404）。置空后的行为与现状完全一致：敏感操作 fail-closed，报"尚未配置…审查模型"（既有行为，已被 `test_workspace_review_fails_closed_without_reviewer_model`、`test_file_access_review_fails_closed_without_reviewer_model`、`test_switch_workspace_review_missing_model_raises` 锁定）。**不引入"主模型自审"回退**——那是安全语义变化，不在本次范围。
 - 媒体模型名同理：切提供商后旧的 image/video 模型名属于旧提供商，采用目标条目里保存的值（没有就是空，媒体生成时提示未配置）。
 
 ### 模型目录的来源（优先级）
@@ -114,9 +114,9 @@ Prana 目前的主模型切换体验：
 |---|---|
 | `providers.py` | 不变或加 provider_key 构造辅助 |
 | `settings_store.py` | `provider_vault` 的 load/save/加密（沿用 CryptProtectData 封装）+ 旧文件兼容 |
-| `ai_client.py` | `fetch_main_provider_models` 参数化为任意 base_url/key；`save_configuration` 接受 vault 条目并 upsert；`_review_sensitive_operation` 切提供商后 review_model 置空的逻辑 |
+| `ai_client.py` | `fetch_main_provider_models` 参数化为任意 base_url/key；`save_configuration` 接受 vault 条目并 upsert；（`_review_sensitive_operation` 不动——fail-closed 行为保持不变） |
 | `main.py` | `_open_settings` 加提供商下拉 + 联动预填 + 目录选择 + 刷新按钮；`_open_linked_providers` 的"刷新模型"改为写 vault 条目 |
-| `tests/` | settings_store 往返 + 旧文件兼容；vault 迁移；目录拉取参数化；切换后 review 回退；sidebar 状态 |
+| `tests/` | settings_store 往返 + 旧文件兼容；vault 迁移；目录拉取参数化；切换后 review 置空 → fail-closed 报错；sidebar 状态 |
 
 ## 约束
 
@@ -131,3 +131,4 @@ Prana 目前的主模型切换体验：
 - vault 条目的 `api_key_hint` 生成规则（前 4 后 4 vs 后 4）
 - 非 preset 提供商时侧边栏的展示文案
 - 刷新模型失败时的提示方式（messagebox vs 内联 Label）
+- 既有失败测试 `tests/test_provider_sidebar.py::test_fresh_start_shows_both_providers_and_prefills_without_saving`（改动前就红：期望 "Kimi" 开头的按钮名，实际 preset 名为 "kimi（kimi官方）"；kimi 地址已修为 moonshot，URL 断言现可通过）：对齐测试到 `providers.py` 现状即可，不改 UI 文案（我的倾向）
