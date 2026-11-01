@@ -3153,6 +3153,17 @@ class StreamRequestTests(unittest.TestCase):
                                 on_event=lambda k, t: None)
         self.assertEqual(urlopen.call_count, 1)
 
+    def test_cancel_before_output_stops_retrying(self) -> None:
+        client = AIClient({"api_key": "k", "base_url": "https://x.test/v1", "model": "m"})
+        with patch.object(client, "_complete_message_once_stream",
+                          side_effect=RuntimeError("AI 服务返回了空的流式响应。")) as once, \
+             patch("ai_client.time.sleep"):
+            with self.assertRaises(RuntimeError):
+                client.complete([{"role": "user", "content": "你好"}],
+                                on_event=lambda k, t: None,
+                                should_stop=lambda: True)
+        self.assertEqual(once.call_count, 1)
+
 
 class MediaSkillsStreamTests(unittest.TestCase):
     def test_media_skills_emits_round_per_model_call(self) -> None:

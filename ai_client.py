@@ -2379,6 +2379,8 @@ class AIClient:
             except RuntimeError as error:
                 if emitted[0]:
                     raise
+                if should_stop is not None and should_stop():
+                    raise
                 last_error = error
                 if attempt < MAX_CHAT_REQUEST_ATTEMPTS - 1:
                     time.sleep(RETRY_DELAY_SECONDS[attempt])
@@ -2554,12 +2556,10 @@ class AIClient:
                     result = responses_adapter.parse_response(
                         payload, model=self.model, base_url=self.base_url,
                     )
-                    for reasoning in (
-                        streaming.responses_reasoning_text(payload)
-                    ,):
-                        if reasoning:
-                            on_event("reasoning", reasoning)
-                            emitted[0] = True
+                    reasoning = streaming.responses_reasoning_text(payload)
+                    if reasoning:
+                        on_event("reasoning", reasoning)
+                        emitted[0] = True
                 else:
                     try:
                         result = payload["choices"][0]["message"]
