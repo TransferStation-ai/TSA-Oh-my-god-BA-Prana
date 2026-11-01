@@ -27,7 +27,7 @@ Prana 目前的主模型切换体验：
 
 | 件 | 位置 | 说明 |
 |---|---|---|
-| `BUILTIN_PROVIDERS`（3 个 preset） | `providers.py` | Agnes AI / OpenAI GPT官方 / kimi官方；**后两者 base_url 相同**（`https://api.openai.com/v1`）——按 base_url 建 Key 库会撞车，Key 库必须以 preset 为粒度 |
+| `BUILTIN_PROVIDERS`（3 个 preset） | `providers.py` | Agnes AI / OpenAI GPT官方 / kimi官方（kimi 地址已修为 `https://api.moonshot.cn/v1`，三者互不冲突）；Key 库仍以 preset 为粒度存储（防御性：将来两个 preset 同地址也不撞车） |
 | Key 加密 | `settings_store.py` | Windows `CryptProtectData`（同 Windows 用户会话内可解密），base64 包裹；`api_key`、子代理 Key、linked provider Key 全部已走此路 |
 | linked providers | `settings.json → linked_providers` | 每条已含 `base_url`、加密 `api_key`、`models[{id,name,brainstorm}]`、`compatible/disabled`；"填入主模型"（`_open_opencode_import`）已能把 Key+地址+模型自动填进主设置字段——**Key 只填一次**在这条路上基本已实现 |
 | `/models` 拉取 | `ai_client.py: fetch_main_provider_models()` | GET `{base_url}/models`（Bearer），返回 `[{id,name}]`，上限 200；现在只为主提供商拉 |
@@ -60,7 +60,7 @@ Prana 目前的主模型切换体验：
 }
 ```
 
-- **Vault key（provider_key）= 提供商粒度**，解决 OpenAI 与 kimi 共享 base_url 的撞车：
+- **Vault key（provider_key）= 提供商粒度**（当前 3 个 preset 的 base_url 已互不相同，此粒度为防御性设计）：
   - 内置 preset：`preset:<名称>`（同名两个 preset 各存各的 Key）
   - 来自 opencode 链接的：`linked:<id>`（id 稳定）
   - 用户手填的自定义地址：`custom:<normalize_base_url(地址)>`
