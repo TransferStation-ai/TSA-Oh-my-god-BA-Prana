@@ -1238,6 +1238,7 @@ class AIClient:
             Callable[[dict[str, object], list[dict[str, object]]], None]
             | None
         ) = None,
+        on_event: Callable[[str, str], None] | None = None,
     ) -> tuple[str, list[Path]]:
         working_messages = [dict(message) for message in messages]
         if media_types:
@@ -1281,6 +1282,8 @@ class AIClient:
 
         desktop_screenshots = 0
         for round_index in range(MAX_TOOL_ROUNDS):
+            if on_event is not None:
+                on_event("round", "")
             assistant_message = self._complete_message(
                 working_messages,
                 tools=tool_list,
@@ -1292,6 +1295,8 @@ class AIClient:
                     if forced_tool and round_index == 0
                     else None
                 ),
+                on_event=on_event,
+                should_stop=should_stop if should_stop is not None else None,
             )
             tool_calls = assistant_message.get("tool_calls")
             if not tool_calls:

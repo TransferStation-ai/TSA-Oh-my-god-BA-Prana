@@ -3154,5 +3154,32 @@ class StreamRequestTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 1)
 
 
+class MediaSkillsStreamTests(unittest.TestCase):
+    def test_media_skills_emits_round_per_model_call(self) -> None:
+        client = AIClient({"api_key": "k", "base_url": "https://x.test/v1", "model": "m"})
+        rounds = []
+        with patch.object(client, "_complete_message",
+                          side_effect=[{"role": "assistant", "content": "好"}]):
+            client.complete_with_media_skills(
+                [{"role": "user", "content": "在吗"}],
+                on_event=lambda kind, text: rounds.append(kind),
+            )
+        self.assertEqual(rounds, ["round"])
+
+    def test_media_skills_forwards_should_stop(self) -> None:
+        client = AIClient({"api_key": "k", "base_url": "https://x.test/v1", "model": "m"})
+        seen = {}
+        def fake_complete(messages, **kwargs):
+            seen.update(kwargs)
+            return {"role": "assistant", "content": "好"}
+        with patch.object(client, "_complete_message", side_effect=fake_complete):
+            client.complete_with_media_skills(
+                [{"role": "user", "content": "在吗"}], should_stop=lambda: True,
+                on_event=lambda kind, text: None,
+            )
+        self.assertIs(seen["should_stop"](), True)
+        self.assertIsNotNone(seen["on_event"])
+
+
 if __name__ == "__main__":
     unittest.main()
