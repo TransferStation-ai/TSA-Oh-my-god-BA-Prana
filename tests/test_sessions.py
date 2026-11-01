@@ -258,6 +258,24 @@ class SessionStoreTests(unittest.TestCase):
         self.assertTrue(message["muted"])
 
 
+    def test_new_message_stores_reasoning_blocks(self) -> None:
+        message = new_message(
+            "assistant", "答案", display="答案",
+            reasoning_blocks=[{"text": "想", "seconds": 3.0}],
+        )
+        self.assertEqual(message["reasoning_blocks"], [{"text": "想", "seconds": 3.0}])
+
+    def test_new_message_omits_empty_reasoning_blocks(self) -> None:
+        self.assertNotIn("reasoning_blocks", new_message("assistant", "答案"))
+
+    def test_build_api_messages_never_sends_reasoning_blocks(self) -> None:
+        session = self.store.new_session()
+        session["messages"] = [new_message(
+            "assistant", "答案", reasoning_blocks=[{"text": "想", "seconds": 1.0}],
+        )]
+        self.assertNotIn("reasoning_blocks", build_api_messages(session)[0])
+
+
 class SessionValidationTests(unittest.TestCase):
     def test_turn_records_are_valid_on_brainstorm_sessions(self) -> None:
         temporary = tempfile.TemporaryDirectory()

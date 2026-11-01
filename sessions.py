@@ -80,6 +80,7 @@ def new_message(
     tool_results: list[dict[str, object]] | None = None,
     tool_call_id: str | None = None,
     responses_metadata: dict[str, object] | None = None,
+    reasoning_blocks: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     message = {
         "id": new_id(),
@@ -106,6 +107,8 @@ def new_message(
     }
     if responses_metadata is not None:
         message[RESPONSES_METADATA] = deepcopy(responses_metadata)
+    if reasoning_blocks:
+        message["reasoning_blocks"] = [dict(block) for block in reasoning_blocks]
     return message
 
 
