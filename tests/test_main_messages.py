@@ -128,6 +128,51 @@ class ThinkingBlockTests(unittest.TestCase):
         self.assertFalse(view.finalized)
 
 
+class StreamLifecycleTests(unittest.TestCase):
+    def _build_app(self, view):
+        import threading
+
+        app = object.__new__(main.PranaApp)
+        app.state_lock = threading.RLock()
+        app.stream_views = {view.request_id: view}
+        app.closing = False
+        app.pending_requests = {}
+        return app
+
+    def test_handle_reply_discards_view_for_cancelled_request(self) -> None:
+        import streaming
+
+        view = main._StreamView(
+            11, "s", "u1", streaming.StreamBuffer(), streaming.StreamState()
+        )
+        app = self._build_app(view)
+        request = main.ChatRequest(11, "s", "u1", "hi", [])
+
+        app._handle_reply(request, None, "boom", None, [])
+
+        self.assertTrue(view.finalized)
+        self.assertNotIn(11, app.stream_views)
+
+    def test_pump_stream_drops_view_when_widgets_are_gone(self) -> None:
+        import streaming
+
+        view = main._StreamView(
+            12, "s", "u1", streaming.StreamBuffer(), streaming.StreamState()
+        )
+        view.buffer.push("content", "x")
+        app = self._build_app(view)
+
+        def explode(current, action, payload):
+            raise main.tk.TclError("bad window path name")
+
+        app._apply_stream_action = explode
+
+        app._pump_stream(view)
+
+        self.assertTrue(view.finalized)
+        self.assertNotIn(12, app.stream_views)
+
+
 class StreamFinalizeTests(unittest.TestCase):
     def _build_app(self, view):
         import threading

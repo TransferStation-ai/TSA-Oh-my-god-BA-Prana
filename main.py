@@ -4001,13 +4001,22 @@ class PranaApp:
         self.message_text_labels.append((label, 0))
         view.label = label
 
+    def _discard_stream_view(self, view: _StreamView) -> None:
+        view.finalized = True
+        with self.state_lock:
+            if self.stream_views.get(view.request_id) is view:
+                self.stream_views.pop(view.request_id, None)
+
     def _pump_stream(self, view: _StreamView) -> None:
         if self.closing or view.finalized:
             return
         events, _closed = view.buffer.drain()
-        for kind, text, timestamp in events:
-            for action, payload in view.state.apply(kind, text, timestamp):
-                self._apply_stream_action(view, action, payload)
+        try:
+            for kind, text, timestamp in events:
+                for action, payload in view.state.apply(kind, text, timestamp):
+                    self._apply_stream_action(view, action, payload)
+        except tk.TclError:
+            self._discard_stream_view(view)
 
     def _apply_stream_action(
         self, view: _StreamView, action: str, payload: object
@@ -4041,16 +4050,20 @@ class PranaApp:
             return view.state.content, list(view.state.blocks)
         view.finalized = True
         events, _closed = view.buffer.drain()
-        for kind, text, timestamp in events:
-            for action, payload in view.state.apply(kind, text, timestamp):
+        try:
+            for kind, text, timestamp in events:
+                for action, payload in view.state.apply(kind, text, timestamp):
+                    self._apply_stream_action(view, action, payload)
+            for action, payload in view.state.finish(time.monotonic()):
                 self._apply_stream_action(view, action, payload)
-        for action, payload in view.state.finish(time.monotonic()):
-            self._apply_stream_action(view, action, payload)
-        with self.state_lock:
-            if self.stream_views.get(view.request_id) is view:
-                self.stream_views.pop(view.request_id, None)
+        except tk.TclError:
+            pass
+        self._discard_stream_view(view)
         if view.row is not None:
-            view.row.destroy()
+            try:
+                view.row.destroy()
+            except tk.TclError:
+                pass
             view.row = None
         return view.state.content, list(view.state.blocks)
 
@@ -4092,6 +4105,9 @@ class PranaApp:
             if self.pending_requests.pop(
                 request.request_id, None
             ) is None:
+                view = self.stream_views.get(request.request_id)
+                if view is not None:
+                    self._discard_stream_view(view)
                 return
         if self.closing:
             return
