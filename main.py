@@ -2343,6 +2343,7 @@ class PranaApp:
             is_muted=bool(message.get("muted")),
             media_paths=media_paths,
             on_retry=on_retry,
+            reasoning_blocks=message.get("reasoning_blocks"),
         )
 
     @staticmethod
@@ -4167,6 +4168,7 @@ class PranaApp:
         is_muted: bool = False,
         media_paths: list[Path] | None = None,
         on_retry: Callable[[], None] | None = None,
+        reasoning_blocks: list[dict[str, object]] | None = None,
     ) -> None:
         if self.welcome is not None:
             self.welcome.destroy()
@@ -4176,10 +4178,21 @@ class PranaApp:
         row = tk.Frame(self.message_list, bg=BACKGROUND, pady=6)
         row.pack(fill=tk.X)
         bubble_bg = "#34324a" if role == "user" else SURFACE
-        bubble = tk.Frame(row, bg=bubble_bg, padx=14, pady=10)
+        wraplength = max(240, self.canvas.winfo_width() - 180)
+        blocks = streaming.normalize_reasoning_blocks(reasoning_blocks)
+        container = row
+        if blocks:
+            container = tk.Frame(row, bg=BACKGROUND)
+            container.pack(side=tk.LEFT, anchor=tk.W)
+            for block in blocks:
+                widget = ThinkingBlock(container, wraplength)
+                widget.append(str(block["text"]))
+                widget.finish(float(block["seconds"]))
+                widget.frame.pack(fill=tk.X, pady=(0, 4))
+                self.message_text_labels.extend(widget.labels)
+        bubble = tk.Frame(container, bg=bubble_bg, padx=14, pady=10)
         bubble.pack(side=tk.RIGHT if role == "user" else tk.LEFT)
         text_color = ERROR if is_error else MUTED if is_muted else TEXT
-        wraplength = max(240, self.canvas.winfo_width() - 180)
         segments = split_message_segments(message) if message else []
         for kind, segment in segments:
             if kind == "code":
@@ -4655,8 +4668,14 @@ class PranaApp:
     def _resize_messages(self, event: tk.Event) -> None:
         self.canvas.itemconfigure(self.messages_window, width=event.width)
         wraplength = max(240, event.width - 180)
+        alive = []
         for label, offset in self.message_text_labels:
-            label.configure(wraplength=max(200, wraplength - offset))
+            try:
+                label.configure(wraplength=max(200, wraplength - offset))
+            except tk.TclError:
+                continue
+            alive.append((label, offset))
+        self.message_text_labels[:] = alive
 
 
 def main() -> None:

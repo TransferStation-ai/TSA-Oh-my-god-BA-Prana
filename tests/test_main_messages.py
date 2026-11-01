@@ -109,6 +109,12 @@ class ThinkingBlockTests(unittest.TestCase):
         assert hasattr(main, "ThinkingBlock")
         assert main.THINKING_LINE == "#3a3a4a"
 
+    def test_add_message_accepts_reasoning_blocks_signature(self) -> None:
+        import inspect
+        import main
+        params = inspect.signature(main.PranaApp._add_message).parameters
+        assert "reasoning_blocks" in params
+
 
 if __name__ == "__main__":
     unittest.main()
