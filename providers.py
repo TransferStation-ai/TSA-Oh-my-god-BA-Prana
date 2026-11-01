@@ -29,4 +29,10 @@ BUILTIN_PROVIDERS = (
         image_model="gpt-image-1",
         video_model="sora-2",
     ),
+    ProviderPreset(
+        name="kimi（kimi官方）",
+        base_url="https://api.openai.com/v1",
+        image_model="kimi-k3.1-pro",
+        video_model="kimi-k3.1-pro",
+    ),
 )
