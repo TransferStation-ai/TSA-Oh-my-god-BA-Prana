@@ -30,6 +30,7 @@ from sessions import (
     new_message,
 )
 from skills.desktop import start_escape_watchdog
+import streaming
 
 
 SYSTEM_PROMPT = (
@@ -117,6 +118,172 @@ ERROR = "#ff9b9b"
 CODE_BACKGROUND = "#11121a"
 CODE_TEXT = "#dcdcea"
 STOPPED_MESSAGE = "（已停止生成）"
+THINKING_LINE = "#3a3a4a"
+THINKING_ICON_ACTIVE = "✳"
+THINKING_ICON_COLLAPSED = "▸"
+THINKING_ICON_EXPANDED = "▾"
+
+
+class ThinkingBlock:
+    """可折叠思考块：生成中显示 Thinking + 微光，完成后折叠为 ▸ Thought 7s。"""
+
+    def __init__(self, parent: tk.Misc, wraplength: int) -> None:
+        self.frame = tk.Frame(parent, bg=BACKGROUND)
+        self.header = tk.Frame(self.frame, bg=BACKGROUND, padx=10, pady=6)
+        self.header.pack(fill=tk.X)
+        self.icon = tk.Label(
+            self.header, text="", bg=BACKGROUND, fg=MUTED, font=("Segoe UI", 9)
+        )
+        self.icon.pack(side=tk.LEFT, padx=(0, 6))
+        self.title = tk.Label(
+            self.header,
+            text="",
+            bg=BACKGROUND,
+            fg=MUTED,
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.title.pack(side=tk.LEFT)
+        self.subtitle = tk.Label(
+            self.header, text="", bg=BACKGROUND, fg=MUTED, font=("Segoe UI", 9)
+        )
+        self.subtitle.pack(side=tk.LEFT, padx=(8, 0))
+        self.body_frame = tk.Frame(self.frame, bg=BACKGROUND)
+        self.bar = tk.Frame(self.body_frame, bg=THINKING_LINE, width=2)
+        self.bar.pack(side=tk.LEFT, fill=tk.Y)
+        self.body_label = tk.Label(
+            self.body_frame,
+            text="",
+            bg=BACKGROUND,
+            fg=MUTED,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=max(200, wraplength - 70),
+            font=("Segoe UI", 9),
+        )
+        self.body_label.pack(side=tk.LEFT, fill=tk.X, padx=(6, 4))
+        for widget in (self.frame, self.header):
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", lambda _event: self.toggle())
+        self.title.bind("<Enter>", lambda _event: self.title.configure(fg=TEXT))
+        self.title.bind("<Leave>", lambda _event: self.title.configure(fg=MUTED))
+        self.text = ""
+        self.labels: list[tuple[tk.Label, int]] = [
+            (self.subtitle, 0),
+            (self.body_label, 70),
+        ]
+        self._finished = False
+        self._destroyed = False
+        self._shimmer_job: str | None = None
+        self._shimmer_index = 0
+        self._shimmer_step = 1
+        self._shimmer_colors = streaming.shimmer_colors(MUTED, TEXT)
+        self._wrap_labels: list[tuple[tk.Label, int]] = [(self.body_label, 70)]
+        self._wraplength = wraplength
+
+    def begin(self) -> None:
+        self.title.configure(text="Thinking")
+        self.icon.configure(text=THINKING_ICON_ACTIVE)
+        self.body_frame.pack(fill=tk.X, padx=10)
+        self._start_shimmer()
+
+    def _start_shimmer(self) -> None:
+        colors = self._shimmer_colors
+
+        def pulse() -> None:
+            if self._destroyed or self._finished:
+                return
+            self.title.configure(fg=colors[self._shimmer_index])
+            length = len(colors)
+            next_index = self._shimmer_index + self._shimmer_step
+            if next_index >= length or next_index < 0:
+                self._shimmer_step = -self._shimmer_step
+                next_index = self._shimmer_index + self._shimmer_step
+            self._shimmer_index = next_index
+            self._shimmer_job = self.frame.after(90, pulse)
+
+        pulse()
+
+    def _stop_shimmer(self) -> None:
+        if self._shimmer_job is not None:
+            try:
+                self.frame.after_cancel(self._shimmer_job)
+            except tk.TclError:
+                pass
+            self._shimmer_job = None
+
+    def append(self, text: str) -> None:
+        self.text += text
+        self.body_label.configure(text=self.text.strip())
+        self.subtitle.configure(text=streaming.reasoning_heading(self.text))
+
+    def finish(self, seconds: float) -> None:
+        self._stop_shimmer()
+        self.title.configure(text="Thought", fg=MUTED)
+        self.subtitle.configure(text=streaming.format_reasoning_duration(seconds))
+        self.icon.configure(text=THINKING_ICON_COLLAPSED)
+        self.body_frame.pack_forget()
+        self._finished = True
+        if "```" in self.text:
+            self._rebuild_body()
+
+    def _rebuild_body(self) -> None:
+        for child in self.body_frame.winfo_children():
+            if child is not self.bar:
+                child.destroy()
+        new_labels: list[tuple[tk.Label, int]] = []
+        wrap = self._wraplength
+        for kind, segment in split_message_segments(self.text):
+            if kind == "code":
+                code_frame = tk.Frame(
+                    self.body_frame, bg=CODE_BACKGROUND, padx=10, pady=6
+                )
+                code_frame.pack(fill=tk.X, pady=(4, 4))
+                code_label = tk.Label(
+                    code_frame,
+                    text=segment,
+                    bg=CODE_BACKGROUND,
+                    fg=CODE_TEXT,
+                    justify=tk.LEFT,
+                    anchor=tk.W,
+                    wraplength=max(180, wrap - 90),
+                    font=("Consolas", 9),
+                )
+                code_label.pack(anchor=tk.W)
+                new_labels.append((code_label, 30))
+            else:
+                text_label = tk.Label(
+                    self.body_frame,
+                    text=segment,
+                    bg=BACKGROUND,
+                    fg=MUTED,
+                    justify=tk.LEFT,
+                    anchor=tk.W,
+                    wraplength=max(200, wrap - 70),
+                    font=("Segoe UI", 9),
+                )
+                text_label.pack(anchor=tk.W, pady=(2, 2))
+                new_labels.append((text_label, 30))
+        self.labels = new_labels
+        self._wrap_labels = new_labels
+
+    def toggle(self) -> None:
+        if self.body_frame.winfo_ismapped():
+            self.body_frame.pack_forget()
+            self.icon.configure(text=THINKING_ICON_COLLAPSED)
+        else:
+            self.body_frame.pack(fill=tk.X, padx=10)
+            self.icon.configure(text=THINKING_ICON_EXPANDED)
+
+    def set_wraplength(self, value: int) -> None:
+        self._wraplength = value
+        for label, offset in self._wrap_labels:
+            minimum = 180 if offset == 90 else 200
+            label.configure(wraplength=max(minimum, value - offset))
+
+    def destroy(self) -> None:
+        self._destroyed = True
+        self._stop_shimmer()
+        self.frame.destroy()
 
 
 @dataclass
@@ -436,8 +603,8 @@ class PranaApp:
             summary = summaries[index]
             if not messagebox.askyesno(
                 "删除会话",
-                "确定要删除该会话及其头脑风暴子会话吗？"
-                "此操作无法撤销。",
+                "此会话会从您的磁盘中消失"
+                "真的要删除吗？他真的很久都不会再回来了。",
                 parent=dialog,
             ):
                 return

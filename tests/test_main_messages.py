@@ -103,5 +103,12 @@ class BuildRequestMessagesTests(unittest.TestCase):
         assert "switch_workspace" in SYSTEM_PROMPT
 
 
+class ThinkingBlockTests(unittest.TestCase):
+    def test_thinking_block_is_available(self) -> None:
+        import main
+        assert hasattr(main, "ThinkingBlock")
+        assert main.THINKING_LINE == "#3a3a4a"
+
+
 if __name__ == "__main__":
     unittest.main()
