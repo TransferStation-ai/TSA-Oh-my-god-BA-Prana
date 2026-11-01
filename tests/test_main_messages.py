@@ -115,6 +115,18 @@ class ThinkingBlockTests(unittest.TestCase):
         params = inspect.signature(main.PranaApp._add_message).parameters
         assert "reasoning_blocks" in params
 
+    def test_stream_view_defaults(self) -> None:
+        import streaming
+        view = main._StreamView(
+            1, "s", "u", streaming.StreamBuffer(), streaming.StreamState()
+        )
+        self.assertIsNone(view.row)
+        self.assertIsNone(view.column)
+        self.assertIsNone(view.bubble)
+        self.assertIsNone(view.label)
+        self.assertIsNone(view.thinking)
+        self.assertFalse(view.finalized)
+
 
 if __name__ == "__main__":
     unittest.main()

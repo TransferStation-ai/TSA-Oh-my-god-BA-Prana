@@ -24,6 +24,7 @@ def _build_app(tmp_path, permanent_workspace=None):
     app.active_session_id = session_id
     app.active_session = {"permanent_workspace": permanent_workspace}
     app.state_lock = threading.RLock()
+    app.stream_views = {}
     app.pending_requests = {}
     app.session_store = FakeSessionStore(
         {

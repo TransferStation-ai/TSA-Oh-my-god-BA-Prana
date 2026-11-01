@@ -298,6 +298,21 @@ class ChatRequest:
 
 
 @dataclass
+class _StreamView:
+    request_id: int
+    session_id: str
+    user_message_id: str
+    buffer: streaming.StreamBuffer
+    state: streaming.StreamState
+    row: tk.Frame | None = None
+    column: tk.Frame | None = None
+    bubble: tk.Frame | None = None
+    label: tk.Label | None = None
+    thinking: ThinkingBlock | None = None
+    finalized: bool = False
+
+
+@dataclass
 class _DesktopSessionState:
     authorized: bool = False
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -349,6 +364,7 @@ class PranaApp:
         self.live_brainstorm_sessions: set[str] = set()
         self.attachment_paths: list[str] = []
         self.state_lock = threading.RLock()
+        self.stream_views: dict[int, _StreamView] = {}
         self.request_queue: queue.Queue[ChatRequest | None] = queue.Queue()
         self.ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self.pending_requests: dict[int, ChatRequest] = {}
@@ -3824,6 +3840,8 @@ class PranaApp:
 
                 self._post_to_ui(refresh_indicator)
 
+            view = self._new_stream_view(request)
+            on_event = self._stream_event_callback(view)
             reply, generated_media = (
                 self.ai_client.complete_with_media_skills(
                     messages,
@@ -3838,6 +3856,7 @@ class PranaApp:
                     permanent_root=workspace_root_holder[0],
                     permanent_root_provider=workspace_root_provider,
                     on_workspace_switched=on_workspace_switched,
+                    on_event=on_event,
                     should_stop=request.cancel_event.is_set,
                     tool_exchange_recorder=record_tool_exchange,
                 )
@@ -3910,6 +3929,102 @@ class PranaApp:
         ):
             return
         self._add_message("assistant", text)
+
+    def _new_stream_view(self, request: ChatRequest) -> _StreamView:
+        view = _StreamView(
+            request.request_id,
+            request.session_id,
+            request.user_message_id,
+            streaming.StreamBuffer(),
+            streaming.StreamState(),
+        )
+        with self.state_lock:
+            self.stream_views[request.request_id] = view
+        return view
+
+    def _stream_event_callback(
+        self, view: _StreamView
+    ) -> Callable[[str, str], None]:
+        def on_event(kind: str, text: str) -> None:
+            view.buffer.push(kind, text)
+            if view.buffer.request_wakeup():
+                self._post_to_ui(
+                    lambda current=view: self._pump_stream(current)
+                )
+
+        return on_event
+
+    def _wraplength(self) -> int:
+        return max(240, self.canvas.winfo_width() - 180)
+
+    def _dismiss_welcome(self) -> None:
+        if self.welcome is not None:
+            self.welcome.destroy()
+            self.welcome = None
+
+    def _ensure_stream_row(self, view: _StreamView) -> None:
+        if view.row is not None:
+            return
+        follow = streaming.should_follow(self.canvas.yview()[1])
+        view.row = tk.Frame(self.message_list, bg=BACKGROUND, pady=6)
+        view.row.pack(fill=tk.X)
+        view.column = tk.Frame(view.row, bg=BACKGROUND)
+        view.column.pack(side=tk.LEFT, anchor=tk.W)
+        self._dismiss_welcome()
+        if follow:
+            self.root.after_idle(lambda: self.canvas.yview_moveto(1.0))
+
+    def _ensure_stream_bubble(self, view: _StreamView) -> None:
+        if view.bubble is not None:
+            return
+        view.bubble = tk.Frame(view.column, bg=SURFACE, padx=14, pady=10)
+        view.bubble.pack(anchor=tk.W, pady=(4, 0))
+        label = tk.Label(
+            view.bubble,
+            text="",
+            bg=SURFACE,
+            fg=TEXT,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=self._wraplength(),
+            font=("Segoe UI", 10),
+        )
+        label.pack(anchor=tk.W, pady=(2, 2))
+        self.message_text_labels.append((label, 0))
+        view.label = label
+
+    def _pump_stream(self, view: _StreamView) -> None:
+        if self.closing or view.finalized:
+            return
+        events, _closed = view.buffer.drain()
+        for kind, text, timestamp in events:
+            for action, payload in view.state.apply(kind, text, timestamp):
+                self._apply_stream_action(view, action, payload)
+
+    def _apply_stream_action(
+        self, view: _StreamView, action: str, payload: object
+    ) -> None:
+        if action == "begin_reasoning":
+            self._ensure_stream_row(view)
+            thinking = ThinkingBlock(view.column, self._wraplength())
+            thinking.frame.pack(fill=tk.X, pady=(0, 4))
+            thinking.begin()
+            view.thinking = thinking
+        elif action == "reasoning":
+            if view.thinking is not None:
+                view.thinking.append(str(payload))
+        elif action == "finish_reasoning":
+            if view.thinking is not None:
+                view.thinking.finish(float(payload["seconds"]))
+                self.message_text_labels.extend(view.thinking.labels)
+                view.thinking = None
+        elif action == "content":
+            self._ensure_stream_row(view)
+            self._ensure_stream_bubble(view)
+            if view.label is not None:
+                view.label.configure(text=view.state.content)
+            if streaming.should_follow(self.canvas.yview()[1]):
+                self.root.after_idle(lambda: self.canvas.yview_moveto(1.0))
 
     def _handle_reply(
         self,
@@ -4170,15 +4285,13 @@ class PranaApp:
         on_retry: Callable[[], None] | None = None,
         reasoning_blocks: list[dict[str, object]] | None = None,
     ) -> None:
-        if self.welcome is not None:
-            self.welcome.destroy()
-            self.welcome = None
+        self._dismiss_welcome()
 
         follow = role == "user" or self._is_near_bottom()
         row = tk.Frame(self.message_list, bg=BACKGROUND, pady=6)
         row.pack(fill=tk.X)
         bubble_bg = "#34324a" if role == "user" else SURFACE
-        wraplength = max(240, self.canvas.winfo_width() - 180)
+        wraplength = self._wraplength()
         blocks = streaming.normalize_reasoning_blocks(reasoning_blocks)
         container = row
         if blocks:
