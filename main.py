@@ -1001,7 +1001,7 @@ class PranaApp:
 
     def _describe_current_provider(self) -> str:
         url = normalize_base_url(str(self.ai_client.base_url))
-        vault = getattr(self.ai_client, "provider_vault", None) or {}
+        vault = self.ai_client.provider_vault or {}
         for entry in vault.values():
             entry_url = normalize_base_url(str(entry.get("base_url") or ""))
             if entry_url and entry_url == url:

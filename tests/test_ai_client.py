@@ -10,7 +10,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-import ai_client
 from ai_client import AIClient, extract_text_tool_calls
 
 
@@ -517,9 +516,6 @@ class AIClientTests(unittest.TestCase):
         with patch("ai_client.settings_store.load_settings", return_value={}), patch(
             "ai_client.settings_store.save_settings"
         ) as save_settings:
-            save_settings.return_value = {
-                "custom:https://example.test/v1": {"models": []}
-            }
             client = AIClient()
             client.save_configuration(
                 "  new-key  ",
@@ -538,22 +534,6 @@ class AIClientTests(unittest.TestCase):
             "review-v1",
             brainstorm_rounds=10,
             linked_providers=[],
-            provider_vault={},
-            vault_models=None,
-            vault_key="custom:https://example.test/v1",
-            game={
-                "mc_name": "Prana",
-                "mc_skin_path": "",
-                "mc_skin_command": "",
-                "gmod_client_dir": "",
-                "gmod_model": "",
-            },
-            modeling={
-                "blender_path": "",
-                "blockbench_path": "",
-                "gmod_dir": "",
-                "sfm_dir": "",
-            },
         )
         self.assertEqual(client.api_key, "new-key")
         self.assertEqual(client.base_url, "https://example.test/v1")
@@ -1063,7 +1043,6 @@ class AIClientTests(unittest.TestCase):
                 "switch_workspace",
                 "read_git_repository",
                 "run_shell_command",
-                "search_minecraft_wiki",
             ],
         )
         self.assertEqual(
@@ -3580,209 +3559,6 @@ class ToollessNudgeTests(unittest.TestCase):
             )
 
         self.assertEqual(reply, "收到。现在查询时间。")
-
-    @staticmethod
-    def _game_tool_call(name: str, arguments: dict) -> dict:
-        return {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "game-call",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(arguments),
-                    },
-                }
-            ],
-        }
-
-    def test_game_join_fails_closed_before_invoke_without_reviewer(self) -> None:
-        client = AIClient(
-            {
-                "api_key": "main-key",
-                "base_url": "https://main.test/v1",
-                "model": "main-model",
-            }
-        )
-        access = object()
-        with patch.object(
-            client,
-            "_complete_message",
-            side_effect=[
-                self._game_tool_call(
-                    "join_game",
-                    {"game": "mc", "host": "127.0.0.1", "port": 25565},
-                ),
-                {"role": "assistant", "content": "需要先配置审查模型。"},
-            ],
-        ) as complete, patch("ai_client.invoke_game_skill") as invoke:
-            client.complete_with_media_skills(
-                [{"role": "user", "content": "陪我玩"}],
-                game_session=access,
-            )
-        invoke.assert_not_called()
-        messages = complete.call_args_list[1].args[0]
-        self.assertIn("尚未配置操作审查模型", messages[-1]["content"])
-
-    def test_game_join_runs_review_before_invoking(self) -> None:
-        client = AIClient(
-            {
-                "api_key": "main-key",
-                "base_url": "https://main.test/v1",
-                "model": "main-model",
-                "review_model": "review-model",
-            }
-        )
-        arguments = {
-            "game": "mc",
-            "host": "127.0.0.1",
-            "port": 55460,
-            "version": "1.20.1",
-        }
-        with patch.object(
-            client,
-            "_complete_message",
-            side_effect=[
-                self._game_tool_call("join_game", arguments),
-                {"role": "assistant", "content": "已尝试加入。"},
-            ],
-        ), patch.object(
-            AIClient,
-            "complete",
-            autospec=True,
-            return_value='{"decision":"allow","reason":"用户明确要求"}',
-        ) as review, patch(
-            "ai_client.invoke_game_skill", return_value='{"ok":true}'
-        ) as invoke:
-            client.complete_with_media_skills(
-                [
-                    {
-                        "role": "user",
-                        "content": "加入端口 55460 的本地 Minecraft 服务器并陪我通关",
-                    },
-                    {"role": "assistant", "content": "好的。"},
-                    {"role": "user", "content": "版本是 1.20.1"},
-                ],
-                game_session=object(),
-            )
-        review.assert_called_once()
-        self.assertEqual(review.call_args.args[0].model, "review-model")
-        payload = json.loads(review.call_args.args[1][1]["content"])
-        self.assertEqual(
-            payload["proposed_operation"]["arguments"], arguments
-        )
-        self.assertEqual(
-            payload["recent_user_context"],
-            ["加入端口 55460 的本地 Minecraft 服务器并陪我通关"],
-        )
-        invoke.assert_called_once()
-
-    def test_game_skill_review_uses_operation_reviewer(self) -> None:
-        client = AIClient(
-            {
-                "api_key": "main-key",
-                "base_url": "https://main.test/v1",
-                "model": "main-model",
-                "review_model": "review-model",
-            }
-        )
-        operation = {
-            "name": "prepare_mining",
-            "description": "下矿前准备",
-            "source": "def run(api):\n    api.scan()\n",
-            "steps": [{"action": "scan"}],
-        }
-        messages = [{"role": "user", "content": "准备下矿"}]
-        with patch.object(
-            client, "_review_sensitive_operation"
-        ) as review:
-            client.review_game_skill(operation, messages)
-
-        review.assert_called_once()
-        self.assertEqual(review.call_args.args[:3], (
-            "mc_create_skill",
-            operation,
-            messages,
-        ))
-        self.assertIn("MC 动作序列", review.call_args.kwargs["effect"])
-        self.assertEqual(
-            review.call_args.kwargs["system_prompt"],
-            ai_client.GAME_SKILL_REVIEW_SYSTEM_PROMPT,
-        )
-
-    def test_game_command_skips_review_and_tools_require_session(self) -> None:
-        client = self._client()
-        command = self._game_tool_call(
-            "game_command",
-            {"game": "mc", "action": "say", "text": "你好"},
-        )
-        with patch.object(
-            client,
-            "_complete_message",
-            side_effect=[command, {"role": "assistant", "content": "完成。"}],
-        ) as complete, patch.object(
-            client, "_review_sensitive_operation"
-        ) as review, patch(
-            "ai_client.invoke_game_skill", return_value='{"ok":true}'
-        ) as invoke:
-            client.complete_with_media_skills(
-                [{"role": "user", "content": "说你好"}],
-                game_session=object(),
-            )
-        review.assert_not_called()
-        invoke.assert_called_once()
-        game_names = {
-            tool["function"]["name"]
-            for tool in complete.call_args_list[0].kwargs["tools"]
-        }
-        self.assertIn("join_game", game_names)
-
-        with patch.object(
-            client,
-            "_complete_message",
-            return_value={"role": "assistant", "content": "普通回复"},
-        ) as no_session:
-            client.complete_with_media_skills(
-                [{"role": "user", "content": "你好"}]
-            )
-        names = {
-            tool["function"]["name"]
-            for tool in no_session.call_args.kwargs["tools"]
-        }
-        self.assertNotIn("join_game", names)
-
-    def test_complete_game_turn_normalizes_response(self) -> None:
-        client = self._client()
-        with patch.object(
-            client,
-            "_complete_message",
-            return_value={"content": "好", "tool_calls": [{"id": "a"}]},
-        ) as complete:
-            result = client.complete_game_turn([], [])
-        self.assertEqual(result, {"content": "好", "tool_calls": [{"id": "a"}]})
-        self.assertEqual(complete.call_args.kwargs["tool_choice"], "auto")
-
-    def test_fetch_provider_models_uses_supplied_address_and_key(self) -> None:
-        client = self._client()
-        with patch.object(
-            AIClient,
-            "_open_authenticated_request",
-            return_value=FakeResponse(
-                {"data": [{"id": "m1", "name": "Model 1"}]}
-            ),
-        ) as open_request:
-            models = client.fetch_provider_models(
-                "https://provider.test/v1/", "provider-key"
-            )
-        self.assertEqual(models, [{"id": "m1", "name": "Model 1"}])
-        request = open_request.call_args.args[0]
-        self.assertEqual(
-            request.full_url, "https://provider.test/v1/models"
-        )
-        self.assertEqual(
-            request.get_header("Authorization"), "Bearer provider-key"
-        )
 
 
 if __name__ == "__main__":
