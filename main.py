@@ -993,11 +993,24 @@ class PranaApp:
             )
         self.provider_status.configure(
             text=(
-                "当前使用自定义提供商\n可在右上角设置中调整。"
+                f"当前使用 {self._describe_current_provider()}\n可在设置中切换。"
                 if configured and not matched
                 else "填写对应的 API Key 和模型，保存后使用。"
             )
         )
+
+    def _describe_current_provider(self) -> str:
+        url = normalize_base_url(str(self.ai_client.base_url))
+        vault = getattr(self.ai_client, "provider_vault", None) or {}
+        for entry in vault.values():
+            entry_url = normalize_base_url(str(entry.get("base_url") or ""))
+            if entry_url and entry_url == url:
+                return str(entry.get("name") or "自定义提供商")
+        for provider in self.ai_client.linked_providers or []:
+            provider_url = normalize_base_url(str(provider.get("base_url") or ""))
+            if provider_url and provider_url == url:
+                return str(provider.get("name") or "自定义提供商")
+        return "自定义提供商"
 
     def _refresh_workspace_indicator(self) -> None:
         root = self._active_permanent_root()
