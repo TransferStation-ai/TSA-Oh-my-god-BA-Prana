@@ -63,3 +63,30 @@ BUILTIN_PROVIDERS = (
         video_model="kimi-k3.1-pro",
     ),
 )
+
+
+def preset_vault_key(preset_name: str) -> str:
+    return f"preset:{preset_name}"
+
+
+def linked_vault_key(provider_id: str) -> str:
+    return f"linked:{provider_id}"
+
+
+def custom_vault_key(base_url: str) -> str:
+    return f"custom:{normalize_base_url(base_url)}"
+
+
+def resolve_main_vault_key(base_url: str) -> str:
+    for preset in BUILTIN_PROVIDERS:
+        if preset.matches(base_url):
+            return preset_vault_key(preset.name)
+    return custom_vault_key(base_url)
+
+
+def make_key_hint(api_key: str) -> str:
+    if not api_key:
+        return ""
+    if len(api_key) <= 4:
+        return "…"
+    return f"…{api_key[-4:]}"
