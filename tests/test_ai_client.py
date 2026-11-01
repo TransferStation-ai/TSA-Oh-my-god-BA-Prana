@@ -1,9 +1,11 @@
 import base64
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -3071,6 +3073,85 @@ class AIClientTests(unittest.TestCase):
         tool_message = complete_message.call_args_list[1].args[0][-1]
         self.assertEqual(tool_message["role"], "tool")
         self.assertIn("powershell missing", tool_message["content"])
+
+
+class FakeStreamResponse:
+    def __init__(self, lines, content_type="text/event-stream"):
+        self.lines = [line.encode("utf-8") for line in lines]
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+class StreamRequestTests(unittest.TestCase):
+    def test_stream_request_emits_events_then_returns_message(self) -> None:
+        body = [
+            'data: {"choices":[{"delta":{"reasoning_content":"想"}}]}\n',
+            "\n",
+            'data: {"choices":[{"delta":{"content":"答案"}}]}\n',
+            "\n",
+            "data: [DONE]\n",
+            "\n",
+        ]
+        events = []
+        with patch("ai_client.urllib.request.urlopen",
+                   return_value=FakeStreamResponse(body)) as urlopen:
+            reply = AIClient({"api_key": "k", "base_url": "https://x.test/v1",
+                              "model": "m"}).complete(
+                [{"role": "user", "content": "你好"}],
+                on_event=lambda kind, text: events.append((kind, text)),
+            )
+        self.assertEqual(reply, "答案")
+        self.assertEqual(events, [("reasoning", "想"), ("content", "答案")])
+        self.assertTrue(json.loads(urlopen.call_args.args[0].data)["stream"])
+
+    def test_non_stream_body_falls_back_and_replays_once(self) -> None:
+        body = json.dumps({"choices": [{"message": {
+            "content": "答案", "reasoning_content": "想"}}]}).encode("utf-8")
+        events = []
+        client = AIClient({"api_key": "k", "base_url": "https://x.test/v1", "model": "m"})
+        with patch("ai_client.urllib.request.urlopen",
+                   return_value=FakeResponse(json.loads(body))) as urlopen:
+            reply = client.complete([{"role": "user", "content": "你好"}],
+                                    on_event=lambda k, t: events.append((k, t)))
+        self.assertEqual(reply, "答案")
+        self.assertEqual(events, [("reasoning", "想"), ("content", "答案")])
+        self.assertTrue(client._streaming_disabled)
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_http_400_disables_streaming_and_retries_non_stream(self) -> None:
+        error = urllib.error.HTTPError("u", 400, "bad", {}, io.BytesIO(b'{"error":{"message":"no stream"}}'))
+        client = AIClient({"api_key": "k", "base_url": "https://x.test/v1", "model": "m"})
+        events = []
+        responses = [error, FakeResponse({"choices": [{"message": {"content": "兜底"}}]})]
+        with patch("ai_client.urllib.request.urlopen", side_effect=responses):
+            reply = client.complete([{"role": "user", "content": "你好"}],
+                                    on_event=lambda k, t: events.append((k, t)))
+        self.assertEqual(reply, "兜底")
+        self.assertEqual(events, [("content", "兜底")])
+        self.assertTrue(client._streaming_disabled)
+
+    def test_no_retry_after_partial_content(self) -> None:
+        class BreakingStream(FakeStreamResponse):
+            def __iter__(self):
+                yield 'data: {"choices":[{"delta":{"content":"半"}}]}\n'.encode("utf-8")
+                raise OSError("connection reset")
+
+        client = AIClient({"api_key": "k", "base_url": "https://x.test/v1", "model": "m"})
+        with patch("ai_client.urllib.request.urlopen",
+                   return_value=BreakingStream([])) as urlopen, \
+             patch("ai_client.time.sleep"):
+            with self.assertRaises(RuntimeError):
+                client.complete([{"role": "user", "content": "你好"}],
+                                on_event=lambda k, t: None)
+        self.assertEqual(urlopen.call_count, 1)
 
 
 if __name__ == "__main__":

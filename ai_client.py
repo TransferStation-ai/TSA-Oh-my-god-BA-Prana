@@ -10,7 +10,7 @@ import shutil
 import socket
 import tempfile
 import time
-from typing import Callable
+from typing import Callable, Iterator
 import uuid
 import urllib.error
 import urllib.parse
@@ -18,6 +18,7 @@ import urllib.request
 
 import settings_store
 import responses_adapter
+import streaming
 from brainstorm import (
     BRAINSTORM_TOOL,
     BrainstormParticipant,
@@ -531,6 +532,7 @@ class AIClient:
             raise ValueError("子代理配置格式无效。")
         self.subagents = configured_subagents
         self._validate_subagents(self.subagents)
+        self._streaming_disabled = False
 
     @property
     def is_configured(self) -> bool:
@@ -2289,8 +2291,16 @@ class AIClient:
             raise ValueError(f"视频中没有可读取的画面：{path.name}")
         return frames
 
-    def complete(self, messages: list[dict[str, object]]) -> str:
-        response_message = self._complete_message(messages)
+    def complete(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        on_event: Callable[[str, str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> str:
+        response_message = self._complete_message(
+            messages, on_event=on_event, should_stop=should_stop
+        )
         content = response_message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("AI 服务返回了空回复。")
@@ -2304,6 +2314,8 @@ class AIClient:
         messages: list[dict[str, object]],
         *,
         failure_reason: str | None = None,
+        on_event: Callable[[str, str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> str:
         fallback_messages = [dict(message) for message in messages]
         system_prompt = (
@@ -2316,7 +2328,9 @@ class AIClient:
             0,
             {"role": "system", "content": system_prompt},
         )
-        return self.complete(fallback_messages)
+        return self.complete(
+            fallback_messages, on_event=on_event, should_stop=should_stop
+        )
 
     def _complete_message(
         self,
@@ -2324,32 +2338,56 @@ class AIClient:
         *,
         tools: list[dict[str, object]] | None = None,
         tool_choice: dict[str, object] | str | None = None,
+        on_event: Callable[[str, str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
         if self.configuration_error is not None:
             raise RuntimeError(self.configuration_error)
 
-        last_error: RuntimeError | None = None
+        if on_event is None or self._streaming_disabled:
+            last_error: RuntimeError | None = None
+            for attempt in range(MAX_CHAT_REQUEST_ATTEMPTS):
+                try:
+                    return self._complete_message_once(
+                        messages, tools=tools, tool_choice=tool_choice
+                    )
+                except RuntimeError as error:
+                    last_error = error
+                    if attempt < MAX_CHAT_REQUEST_ATTEMPTS - 1:
+                        time.sleep(RETRY_DELAY_SECONDS[attempt])
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("AI 服务请求失败。")
+
+        last_error = None
         for attempt in range(MAX_CHAT_REQUEST_ATTEMPTS):
+            emitted = [False]
             try:
-                return self._complete_message_once(
-                    messages, tools=tools, tool_choice=tool_choice
+                return self._complete_message_once_stream(
+                    messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    on_event=on_event,
+                    should_stop=should_stop,
+                    emitted=emitted,
                 )
             except RuntimeError as error:
+                if emitted[0]:
+                    raise
                 last_error = error
                 if attempt < MAX_CHAT_REQUEST_ATTEMPTS - 1:
                     time.sleep(RETRY_DELAY_SECONDS[attempt])
-
         if last_error is not None:
             raise last_error
         raise RuntimeError("AI 服务请求失败。")
 
-    def _complete_message_once(
+    def _build_request_payload(
         self,
         messages: list[dict[str, object]],
         *,
-        tools: list[dict[str, object]] | None = None,
-        tool_choice: dict[str, object] | str | None = None,
-    ) -> dict[str, object]:
+        tools: list[dict[str, object]] | None,
+        tool_choice: dict[str, object] | str | None,
+    ) -> tuple[dict[str, object], str, bool]:
         use_responses = responses_adapter.uses_responses(self.base_url)
         if use_responses:
             request_payload = responses_adapter.build_payload(
@@ -2367,6 +2405,19 @@ class AIClient:
             if tool_choice is not None:
                 request_payload["tool_choice"] = tool_choice
         endpoint = "responses" if use_responses else "chat/completions"
+        return request_payload, endpoint, use_responses
+
+    def _complete_message_once(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        tool_choice: dict[str, object] | str | None = None,
+        reasoning_out: list[str] | None = None,
+    ) -> dict[str, object]:
+        request_payload, endpoint, use_responses = self._build_request_payload(
+            messages, tools=tools, tool_choice=tool_choice
+        )
         request = urllib.request.Request(
             f"{self.base_url}/{endpoint}",
             data=json.dumps(
@@ -2400,13 +2451,174 @@ class AIClient:
             raise RuntimeError("AI 服务返回了无法解析的响应。") from error
 
         if use_responses:
-            return responses_adapter.parse_response(
+            result = responses_adapter.parse_response(
                 payload, model=self.model, base_url=self.base_url,
             )
+            if reasoning_out is not None:
+                reasoning_out.append(
+                    streaming.responses_reasoning_text(payload)
+                )
+            return result
         try:
             response_message = payload["choices"][0]["message"]
         except (KeyError, IndexError, TypeError) as error:
             raise RuntimeError("AI 服务响应缺少 assistant 回复内容。") from error
         if not isinstance(response_message, dict):
             raise RuntimeError("AI 服务返回了无效的 assistant 消息。")
+        if reasoning_out is not None:
+            reasoning_out.append(
+                streaming.chat_reasoning_text(response_message)
+            )
         return response_message
+
+    def _complete_message_once_stream(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]] | None,
+        tool_choice: dict[str, object] | str | None,
+        on_event: Callable[[str, str], None],
+        should_stop: Callable[[], bool] | None,
+        emitted: list[bool],
+    ) -> dict[str, object]:
+        request_payload, endpoint, use_responses = self._build_request_payload(
+            messages, tools=tools, tool_choice=tool_choice
+        )
+        request_payload["stream"] = True
+        request = urllib.request.Request(
+            f"{self.base_url}/{endpoint}",
+            data=json.dumps(
+                request_payload,
+                ensure_ascii=False,
+            ).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            response = urllib.request.urlopen(request, timeout=60)
+        except urllib.error.HTTPError as error:
+            if error.code in (400, 404, 415, 501):
+                self._streaming_disabled = True
+                reasoning_out: list[str] = []
+                result = self._complete_message_once(
+                    messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    reasoning_out=reasoning_out,
+                )
+                for reasoning in reasoning_out:
+                    if reasoning:
+                        on_event("reasoning", reasoning)
+                        emitted[0] = True
+                content = result.get("content")
+                if isinstance(content, str) and content:
+                    on_event("content", content)
+                    emitted[0] = True
+                return result
+            details = error.read().decode("utf-8", errors="replace")
+            try:
+                error_payload = json.loads(details)
+                details = error_payload.get("error", {}).get("message", details)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            raise RuntimeError(
+                f"AI 服务返回 HTTP {error.code}: {details[:500]}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(f"无法连接 AI 服务：{error.reason}") from error
+
+        with response:
+            content_type = str(
+                getattr(response, "headers", {}).get("Content-Type", "")
+            )
+            if "event-stream" not in content_type:
+                self._streaming_disabled = True
+                try:
+                    body = response.read()
+                    payload = json.loads(body.decode("utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise RuntimeError(
+                        "AI 服务返回了无法解析的响应。"
+                    ) from error
+                reasoning_out = []
+                if use_responses:
+                    result = responses_adapter.parse_response(
+                        payload, model=self.model, base_url=self.base_url,
+                    )
+                    for reasoning in (
+                        streaming.responses_reasoning_text(payload)
+                    ,):
+                        if reasoning:
+                            on_event("reasoning", reasoning)
+                            emitted[0] = True
+                else:
+                    try:
+                        result = payload["choices"][0]["message"]
+                    except (KeyError, IndexError, TypeError) as error:
+                        raise RuntimeError(
+                            "AI 服务响应缺少 assistant 回复内容。"
+                        ) from error
+                    if not isinstance(result, dict):
+                        raise RuntimeError("AI 服务返回了无效的 assistant 消息。")
+                    reasoning = streaming.chat_reasoning_text(result)
+                    if reasoning:
+                        on_event("reasoning", reasoning)
+                        emitted[0] = True
+                content = result.get("content")
+                if isinstance(content, str) and content:
+                    on_event("content", content)
+                    emitted[0] = True
+                return result
+
+            stream = (
+                streaming.ResponsesStream() if use_responses
+                else streaming.ChatStream()
+            )
+            saw_stream_data = [False]
+
+            def _response_lines() -> Iterator[bytes | str]:
+                for raw in response:
+                    saw_stream_data[0] = True
+                    yield raw
+
+            try:
+                for name, data in streaming.iter_sse(_response_lines()):
+                    if use_responses:
+                        events = stream.feed(name, data)
+                    else:
+                        events = stream.feed(data)
+                    for kind, text in events:
+                        emitted[0] = True
+                        on_event(kind, text)
+                    if should_stop is not None and should_stop():
+                        break
+            except (OSError, UnicodeDecodeError) as error:
+                if saw_stream_data[0]:
+                    # 已收到部分流式数据后再中断：重试会导致内容重复，上抛不重试。
+                    emitted[0] = True
+                raise RuntimeError("AI 服务流式连接中断。") from error
+
+            if not emitted[0]:
+                raise RuntimeError("AI 服务返回了空的流式响应。")
+
+            if use_responses:
+                if stream.final_payload is None:
+                    raise RuntimeError(
+                        "AI 服务流式响应缺少最终结果。"
+                    )
+                return responses_adapter.parse_response(
+                    stream.final_payload,
+                    model=self.model,
+                    base_url=self.base_url,
+                )
+            result = stream.message()
+            finish_reason = stream.finish_reason
+            content = result.get("content")
+            has_content = isinstance(content, str) and content.strip()
+            if finish_reason == "length" and not has_content:
+                raise RuntimeError("AI 服务流式响应被长度限制截断，没有回复内容。")
+            return result
