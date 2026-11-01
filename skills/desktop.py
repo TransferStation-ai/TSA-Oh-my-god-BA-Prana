@@ -137,9 +137,14 @@ DESKTOP_SKILLS: list[dict[str, object]] = [
                         "maximum": 10,
                     },
                     "duration_ms": {
-                        "type": "integer",
+                        "type": ["integer", "null"],
                         "minimum": 0,
                         "maximum": 3000,
+                        "description": (
+                            "鼠标动作的移动时长（毫秒，move/click/drag/scroll）。"
+                            "省略或传 null 时按移动距离自动选择平滑时长；"
+                            "0 表示瞬时定位。"
+                        ),
                     },
                     "text": {"type": "string"},
                     "key": {"type": "string"},
@@ -222,6 +227,23 @@ def _require_int(
     if not minimum <= value <= maximum:
         raise ValueError(f"{name} 必须在 {minimum}-{maximum} 之间。")
     return value
+
+
+def _default_move_duration_ms(
+    start_x: int, start_y: int, x: int, y: int
+) -> int:
+    distance = abs(x - start_x) + abs(y - start_y)
+    if distance == 0:
+        return 0
+    return max(80, min(400, int(distance * 0.25)))
+
+
+def _optional_duration_ms(
+    arguments: dict[str, object], minimum: int, maximum: int
+) -> int | None:
+    if "duration_ms" not in arguments or arguments["duration_ms"] is None:
+        return None
+    return _require_int(arguments, "duration_ms", minimum, maximum, default=0)
 
 
 def _validate_window_id(value: object) -> int:
@@ -330,9 +352,7 @@ def validate_desktop_arguments(
         x, y = _validate_point(
             arguments, "x", "y", window_id=window_id, screen_rect=screen_rect
         )
-        duration_ms = _require_int(
-            arguments, "duration_ms", 0, 2000, default=0
-        )
+        duration_ms = _optional_duration_ms(arguments, 0, 2000)
         params: dict[str, object] = {
             "x": x,
             "y": y,
@@ -349,6 +369,7 @@ def validate_desktop_arguments(
             "window_id",
             "button",
             "count",
+            "duration_ms",
         }:
             raise ValueError("click 包含不支持的参数。")
         if ("x" in arguments) != ("y" in arguments):
@@ -364,7 +385,11 @@ def validate_desktop_arguments(
         if button not in {"left", "right", "middle"}:
             raise ValueError("button 必须是 left、right 或 middle。")
         count = _require_int(arguments, "count", 1, 3, default=1)
-        params = {"button": button, "count": count}
+        params = {
+            "button": button,
+            "count": count,
+            "duration_ms": _optional_duration_ms(arguments, 0, 3000),
+        }
         if "x" in arguments:
             x, y = _validate_point(
                 arguments, "x", "y", window_id=window_id, screen_rect=screen_rect
@@ -414,9 +439,7 @@ def validate_desktop_arguments(
         button = arguments.get("button", "left")
         if button not in {"left", "right", "middle"}:
             raise ValueError("button 必须是 left、right 或 middle。")
-        duration_ms = _require_int(
-            arguments, "duration_ms", 0, 3000, default=0
-        )
+        duration_ms = _optional_duration_ms(arguments, 0, 3000)
         params = {
             "from_x": from_x,
             "from_y": from_y,
@@ -435,8 +458,11 @@ def validate_desktop_arguments(
             "x",
             "y",
             "window_id",
+            "duration_ms",
         }:
-            raise ValueError("scroll 必须提供 amount，只能额外提供 x/y/window_id。")
+            raise ValueError(
+                "scroll 必须提供 amount，只能额外提供 x/y/window_id/duration_ms。"
+            )
         amount = _require_int(arguments, "amount", -10, 10)
         if amount == 0:
             raise ValueError("amount 不能为 0。")
@@ -450,6 +476,7 @@ def validate_desktop_arguments(
         if window_id is not None and "x" not in arguments:
             raise ValueError("带 window_id 的 scroll 必须提供 x 和 y。")
         params = {"amount": amount}
+        params["duration_ms"] = _optional_duration_ms(arguments, 0, 3000)
         if "x" in arguments:
             x, y = _validate_point(
                 arguments, "x", "y", window_id=window_id, screen_rect=screen_rect
@@ -679,9 +706,7 @@ class _WindowsDesktopController:
             x, y = self._resolve_point(
                 window_id, int(params["x"]), int(params["y"])
             )
-            self._move_smooth(
-                x, y, int(params.get("duration_ms", 0))
-            )
+            self._move_smooth(x, y, params.get("duration_ms"))
             return self._mouse_result("move", "已移动鼠标")
         if action == "click":
             if "x" in params:
@@ -690,7 +715,7 @@ class _WindowsDesktopController:
                     int(params["x"]),
                     int(params["y"]),
                 )
-                win_input.set_cursor_position(x, y)
+                self._move_smooth(x, y, params.get("duration_ms"))
             else:
                 x, y = win_input.get_cursor_position()
             button = str(params.get("button", "left"))
@@ -714,8 +739,8 @@ class _WindowsDesktopController:
                 int(params["to_y"]),
             )
             button = str(params.get("button", "left"))
-            duration_ms = int(params.get("duration_ms", 0))
-            win_input.set_cursor_position(from_x, from_y)
+            duration_ms = params.get("duration_ms")
+            self._move_smooth(from_x, from_y, None)
             win_input.mouse_button(button)
             try:
                 self._move_smooth(to_x, to_y, duration_ms)
@@ -728,18 +753,22 @@ class _WindowsDesktopController:
                 x, y = self._resolve_point(
                     window_id, int(params["x"]), int(params["y"])
                 )
-                win_input.set_cursor_position(x, y)
+                self._move_smooth(x, y, params.get("duration_ms"))
             win_input.mouse_wheel(int(params["amount"]))
             return self._mouse_result("scroll", "已滚动滚轮")
         raise ValueError(f"不支持的鼠标动作：{action}")
 
     def _move_smooth(
-        self, x: int, y: int, duration_ms: int
+        self, x: int, y: int, duration_ms: int | None
     ) -> None:
+        start_x, start_y = win_input.get_cursor_position()
+        if duration_ms is None:
+            duration_ms = _default_move_duration_ms(
+                start_x, start_y, x, y
+            )
         if duration_ms <= 0:
             win_input.set_cursor_position(x, y)
             return
-        start_x, start_y = win_input.get_cursor_position()
         steps = max(1, duration_ms // 15)
         for index in range(1, steps + 1):
             current_x = round(
@@ -796,20 +825,13 @@ def _crop_window(
 ):
     if width <= 0 or height <= 0:
         raise RuntimeError("窗口尺寸无效，无法截屏。")
-    box = (
-        left - screen_left,
-        top - screen_top,
-        left - screen_left + width,
-        top - screen_top + height,
-    )
-    if (
-        box[0] < 0
-        or box[1] < 0
-        or box[2] > image.width
-        or box[3] > image.height
-    ):
+    x0 = max(0, left - screen_left)
+    y0 = max(0, top - screen_top)
+    x1 = min(image.width, left - screen_left + width)
+    y1 = min(image.height, top - screen_top + height)
+    if x1 - x0 <= 0 or y1 - y0 <= 0:
         raise RuntimeError("窗口不在可截取范围内。")
-    return image.crop(box)
+    return image.crop((x0, y0, x1, y1))
 
 
 def _capture_image(params: dict[str, object]):

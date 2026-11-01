@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from ai_client import AIClient
+from ai_client import AIClient, extract_text_tool_calls
 
 
 class FakeResponse:
@@ -191,6 +191,198 @@ class ToolExchangeRecorderTests(unittest.TestCase):
                 tool_exchange_recorder=lambda a, r: exchanges.append((a, r)),
             )
         self.assertEqual(exchanges, [])
+
+
+class AntmlTextToolCallTests(unittest.TestCase):
+    """模型偶尔把工具调用写成 invoke/function/parameter 文本标记，
+    Prana 需要解析并执行这些调用，同时把标记从回复和历史中剥离。"""
+
+    def _client(self) -> AIClient:
+        return AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+
+    @staticmethod
+    def _raw_block(
+        function: str, parameters: dict[str, str] | None = None
+    ) -> str:
+        lines = ["<" "invoke>", "<" "function=" + function + ">"]
+        for key, value in (parameters or {}).items():
+            lines.extend(
+                [
+                    "<" "parameter=" + key + ">",
+                    value,
+                    "</" "parameter>",
+                ]
+            )
+        lines.extend(["</" "function>", "</" "invoke>"])
+        return "\n".join(lines) + "\n"
+
+    def test_raw_text_control_desktop_block_is_parsed_and_executed(
+        self,
+    ) -> None:
+        client = self._client()
+        raw_block = self._raw_block(
+            "control_desktop",
+            {"action": "screenshot", "full_screen": "True"},
+        )
+        exchanges: list[tuple[dict, list]] = []
+
+        def record(assistant_message, tool_results):
+            exchanges.append((assistant_message, tool_results))
+
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": "我来截取屏幕画面。\n\n" + raw_block,
+                },
+                {"role": "assistant", "content": "老师，尚未获得授权。"},
+            ],
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [
+                    {"role": "user", "content": "帮我截一张全屏屏幕截图"},
+                ],
+                tool_exchange_recorder=record,
+            )
+
+        self.assertEqual(reply, "老师，尚未获得授权。")
+        self.assertEqual(len(exchanges), 1)
+        recorded_assistant, recorded_results = exchanges[0]
+        calls = recorded_assistant.get("tool_calls")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "control_desktop")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"action": "screenshot", "full_screen": True},
+        )
+        self.assertIn(
+            "尚未获得桌面控制授权", recorded_results[0]["content"]
+        )
+        self.assertNotIn("invoke", recorded_assistant.get("content") or "")
+
+    def test_self_closing_get_system_time_block_is_parsed(self) -> None:
+        client = self._client()
+        raw_block = (
+            "<" "invoke>"
+            "\n"
+            + "<" "function=get_system_time /" ">"
+            + "\n"
+            + "</" "invoke>"
+        )
+        exchanges: list[tuple[dict, list]] = []
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": "现在为您查询时间。\n\n" + raw_block,
+                },
+                {"role": "assistant", "content": "查询完成。"},
+            ],
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "现在几点"}],
+                tool_exchange_recorder=lambda a, r: exchanges.append(
+                    (a, r)
+                ),
+            )
+        self.assertEqual(reply, "查询完成。")
+        self.assertEqual(len(exchanges), 1)
+        recorded_assistant, recorded_results = exchanges[0]
+        calls = recorded_assistant.get("tool_calls")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_system_time")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {})
+        result_payload = json.loads(recorded_results[0]["content"])
+        self.assertIn("datetime", result_payload)
+        self.assertNotIn("error", result_payload)
+
+    def test_unknown_tool_block_is_stripped_not_executed(self) -> None:
+        client = self._client()
+        raw_block = self._raw_block("unknown_tool", {"x": "1"})
+        exchanges: list[tuple[dict, list]] = []
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {
+                    "role": "assistant",
+                    "content": "我会处理。\n\n" + raw_block,
+                },
+            ],
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "你好"}],
+                tool_exchange_recorder=lambda a, r: exchanges.append(
+                    (a, r)
+                ),
+            )
+        self.assertEqual(reply, "我会处理。")
+        self.assertEqual(exchanges, [])
+
+    def test_extract_text_tool_calls_parses_python_style_values(self) -> None:
+        raw = self._raw_block(
+            "control_desktop",
+            {
+                "action": "screenshot",
+                "full_screen": "True",
+                "window_id": "265140",
+                "text": "None",
+            },
+        )
+        calls = extract_text_tool_calls(raw, {"control_desktop"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {
+                "action": "screenshot",
+                "full_screen": True,
+                "window_id": 265140,
+                "text": None,
+            },
+        )
+        self.assertTrue(calls[0]["id"].startswith("antml-"))
+
+    def test_extract_ignores_unknown_tool_names(self) -> None:
+        raw = self._raw_block("unknown_tool", {"x": "1"})
+        self.assertEqual(
+            extract_text_tool_calls(raw, {"control_desktop"}), []
+        )
+
+    def test_namespace_prefixed_block_is_parsed(self) -> None:
+        lt, gt = "<", ">"
+        raw = (
+            lt + "antml:invoke" + gt + "\n"
+            + lt + "antml:function=get_system_time" + gt + "\n"
+            + lt + "/antml:function" + gt + "\n"
+            + lt + "/antml:invoke" + gt
+        )
+        calls = extract_text_tool_calls(raw, {"get_system_time"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_system_time")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {})
+
+    def test_strip_tool_debug_markup_removes_raw_blocks(self) -> None:
+        text = "处理开始。\n\n" + self._raw_block(
+            "control_desktop", {"action": "list_windows"}
+        ) + "\n处理结束。"
+        self.assertEqual(
+            AIClient._strip_tool_debug_markup(text),
+            "处理开始。\n\n处理结束。",
+        )
+        self.assertEqual(
+            AIClient._strip_tool_debug_markup("前 <" "invoke/" ">" " 后"),
+            "前  后",
+        )
 
 
 class AIClientTests(unittest.TestCase):
@@ -3190,6 +3382,183 @@ class MediaSkillsStreamTests(unittest.TestCase):
             )
         self.assertIs(seen["should_stop"](), True)
         self.assertIsNotNone(seen["on_event"])
+
+
+class ToollessNudgeTests(unittest.TestCase):
+    """模型首轮只用文字承诺了操作、却没有实际发出工具调用时，
+    Prana 在上下文里补一条提醒并重试一次，把工具调用找回来。
+
+    背景：2026-11-01 会话事故——用户在工具任务中明确授权后，
+    模型回复「收到。现在列出桌面文件。」却没有产生工具调用，
+    回合直接结束。同一请求重放 12/12 次都能正常调用工具，
+    属于模型间歇性丢调用，应用侧需要一次兜底重试。"""
+
+    def _client(self) -> AIClient:
+        return AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+
+    @staticmethod
+    def _time_call(call_id: str) -> dict:
+        return {
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "get_system_time",
+                "arguments": json.dumps({}),
+            },
+        }
+
+    @staticmethod
+    def _tool_task_messages() -> list[dict]:
+        """历史里已有工具交换：当前处于工具任务流程中。"""
+        return [
+            {"role": "user", "content": "我允许你查询系统时间"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "hist-1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_system_time",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "hist-1",
+                "content": json.dumps({"datetime": "12:00"}),
+            },
+            {"role": "user", "content": "请再查一次时间"},
+        ]
+
+    def test_nudge_recovers_missing_tool_call(self) -> None:
+        client = self._client()
+        exchanges: list[tuple[dict, list]] = []
+        responses = iter(
+            [
+                {"role": "assistant", "content": "收到。现在查询时间。"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [self._time_call("nudged")],
+                },
+                {"role": "assistant", "content": "完成。"},
+            ]
+        )
+        request_snapshots: list[list[dict]] = []
+
+        def fake_complete(messages, **_kwargs):
+            # 快照请求发出那一刻的消息列表（后续轮次会继续追加）。
+            request_snapshots.append([dict(message) for message in messages])
+            return next(responses)
+
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=fake_complete,
+        ) as complete:
+            reply, _ = client.complete_with_media_skills(
+                self._tool_task_messages(),
+                tool_exchange_recorder=lambda a, r: exchanges.append((a, r)),
+            )
+
+        self.assertEqual(reply, "完成。")
+        self.assertEqual(len(exchanges), 1)
+        self.assertEqual(exchanges[0][0]["tool_calls"][0]["id"], "nudged")
+        self.assertEqual(exchanges[0][1][0]["tool_call_id"], "nudged")
+        self.assertEqual(complete.call_count, 3)
+        nudge_messages = request_snapshots[1]
+        self.assertEqual(nudge_messages[-2]["role"], "assistant")
+        self.assertEqual(
+            nudge_messages[-2]["content"], "收到。现在查询时间。"
+        )
+        self.assertEqual(nudge_messages[-1]["role"], "system")
+        self.assertIn("工具调用", str(nudge_messages[-1]["content"]))
+
+    def test_nudge_not_used_in_plain_chat(self) -> None:
+        client = self._client()
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[{"role": "assistant", "content": "现在是 20:00。"}],
+        ) as complete:
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "现在几点"}],
+            )
+
+        self.assertEqual(reply, "现在是 20:00。")
+        self.assertEqual(complete.call_count, 1)
+
+    def test_nudge_skipped_when_stop_requested(self) -> None:
+        client = self._client()
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[{"role": "assistant", "content": "收到。马上执行。"}],
+        ) as complete:
+            client.complete_with_media_skills(
+                self._tool_task_messages(),
+                should_stop=lambda: True,
+            )
+
+        self.assertEqual(complete.call_count, 1)
+
+    def test_nudge_skipped_for_empty_content(self) -> None:
+        client = self._client()
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[{"role": "assistant", "content": None}],
+        ) as complete:
+            with self.assertRaisesRegex(RuntimeError, "空回复"):
+                client.complete_with_media_skills(self._tool_task_messages())
+
+        self.assertEqual(complete.call_count, 1)
+
+    def test_nudge_request_failure_falls_back_to_original_text(self) -> None:
+        client = self._client()
+        exchanges: list[tuple[dict, list]] = []
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {"role": "assistant", "content": "收到。现在查询时间。"},
+                RuntimeError("AI 服务返回 HTTP 429: rate limited"),
+            ],
+        ) as complete:
+            reply, _ = client.complete_with_media_skills(
+                self._tool_task_messages(),
+                tool_exchange_recorder=lambda a, r: exchanges.append((a, r)),
+            )
+
+        self.assertEqual(reply, "收到。现在查询时间。")
+        self.assertEqual(exchanges, [])
+        self.assertEqual(complete.call_count, 2)
+
+    def test_nudge_second_text_reply_keeps_original_text(self) -> None:
+        client = self._client()
+        with patch.object(
+            client,
+            "_complete_message",
+            side_effect=[
+                {"role": "assistant", "content": "收到。现在查询时间。"},
+                {"role": "assistant", "content": "实际上不需要工具。"},
+            ],
+        ):
+            reply, _ = client.complete_with_media_skills(
+                self._tool_task_messages()
+            )
+
+        self.assertEqual(reply, "收到。现在查询时间。")
 
 
 if __name__ == "__main__":

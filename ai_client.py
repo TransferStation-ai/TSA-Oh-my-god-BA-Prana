@@ -1,3 +1,4 @@
+import ast
 import base64
 import html.parser
 import ipaddress
@@ -63,6 +64,11 @@ VIDEO_GENERATION_POLL_SECONDS = 5
 MAX_TOOL_ROUNDS = 20
 MAX_CHAT_REQUEST_ATTEMPTS = 4
 RETRY_DELAY_SECONDS = [5, 10, 15, 20]
+TOOLLESS_NUDGE_PROMPT = (
+    "你上一条回复用文字说明了将执行的操作，但没有实际发出工具调用。"
+    "如果确实有待执行的操作，请立即通过工具调用完成它；"
+    "如果没有需要执行的操作，请简短回应，不要重复承诺。"
+)
 MAX_WEBPAGES = 3
 MAX_WEBPAGE_BYTES = 1024 * 1024
 MAX_WEBPAGE_TEXT_LENGTH = 12000
@@ -230,6 +236,97 @@ TOOL_DEBUG_TAG_PATTERN = re.compile(
 TOOL_DEBUG_SELF_CLOSING_TAG_PATTERN = re.compile(
     r"(?is)<\s*(?:tooi_caiis|tool_ca(?:ll)?s?)\b[^>]*/\s*>"
 )
+ANTML_INVOKE_TAG_PATTERN = re.compile(
+    r"(?is)<\s*(?:[\w.\-]+:)?invoke\b[^>]*>"
+    r".*?<\s*/\s*(?:[\w.\-]+:)?invoke\s*>"
+)
+ANTML_INVOKE_SELF_CLOSING_TAG_PATTERN = re.compile(
+    r"(?is)<\s*(?:[\w.\-]+:)?invoke\b[^>]*/\s*>"
+)
+ANTML_INVOKE_BLOCK_PATTERN = re.compile(
+    r"(?is)<\s*(?:[\w.\-]+:)?invoke\b[^>]*>"
+    r"(.*?)<\s*/\s*(?:[\w.\-]+:)?invoke\s*>"
+)
+ANTML_FUNCTION_TAG_PATTERN = re.compile(
+    r"(?is)<\s*(?:[\w.\-]+:)?function\b\s*=\s*"
+    r"(?:\"(?P<qname>[^\"]+)\"|'(?P<sname>[^']+)'|(?P<name>[^\s/>]+))"
+    r"\s*/?>"
+)
+ANTML_PARAMETER_TAG_PATTERN = re.compile(
+    r"(?is)<\s*(?:[\w.\-]+:)?parameter\b\s*=\s*"
+    r"(?:\"(?P<qkey>[^\"]+)\"|'(?P<skey>[^']+)'|(?P<key>[^\s/>]+))"
+    r"\s*>?\s*(?P<value>.*?)<\s*/\s*(?:[\w.\-]+:)?parameter\s*>"
+)
+ANTML_FUNCTION_FULL_TAG_PATTERN = re.compile(
+    r"(?is)<\s*(?:[\w.\-]+:)?function\b\s*=\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s/>]+)\s*/?>"
+    r".*?<\s*/\s*(?:[\w.\-]+:)?function\s*>"
+)
+ANTML_FUNCTION_SELF_CLOSING_TAG_PATTERN = re.compile(
+    r"(?is)<\s*(?:[\w.\-]+:)?function\b\s*=\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s/>]+)\s*/\s*>"
+)
+
+
+def _parse_text_tool_value(raw: str) -> object:
+    raw = raw.strip()
+    if not raw:
+        return ""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    try:
+        return ast.literal_eval(raw)
+    except (ValueError, SyntaxError, TypeError):
+        return raw
+
+
+def extract_text_tool_calls(
+    content: object,
+    allowed_names: set[str],
+) -> list[dict[str, object]]:
+    """解析模型误写成文本的工具调用块，还原为结构化 tool_calls。
+
+    部分模型在长工具循环的中段会把调用写成带 invoke、function、
+    parameter 标签的文本。这里把这些块还原成 OpenAI 风格的调用，
+    让工具循环可以继续执行；未知工具名的块直接忽略。
+    """
+    if not isinstance(content, str) or not content:
+        return []
+    calls: list[dict[str, object]] = []
+    for block in ANTML_INVOKE_BLOCK_PATTERN.findall(content):
+        function_match = ANTML_FUNCTION_TAG_PATTERN.search(block)
+        if function_match is None:
+            continue
+        name = (
+            function_match.group("qname")
+            or function_match.group("sname")
+            or function_match.group("name")
+        )
+        if not name or name not in allowed_names:
+            continue
+        arguments: dict[str, object] = {}
+        for parameter_match in ANTML_PARAMETER_TAG_PATTERN.finditer(block):
+            key = (
+                parameter_match.group("qkey")
+                or parameter_match.group("skey")
+                or parameter_match.group("key")
+            )
+            arguments[key] = _parse_text_tool_value(
+                parameter_match.group("value")
+            )
+        calls.append(
+            {
+                "id": "antml-" + uuid.uuid4().hex,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+        )
+    return calls
 
 class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(
@@ -348,7 +445,11 @@ class AIClient:
     def _strip_tool_debug_markup(text: object) -> object:
         if not isinstance(text, str):
             return text
-        cleaned = TOOL_DEBUG_TAG_PATTERN.sub("", text, count=0)
+        cleaned = ANTML_INVOKE_TAG_PATTERN.sub("", text, count=0)
+        cleaned = ANTML_INVOKE_SELF_CLOSING_TAG_PATTERN.sub("", cleaned)
+        cleaned = ANTML_FUNCTION_FULL_TAG_PATTERN.sub("", cleaned)
+        cleaned = ANTML_FUNCTION_SELF_CLOSING_TAG_PATTERN.sub("", cleaned)
+        cleaned = TOOL_DEBUG_TAG_PATTERN.sub("", cleaned, count=0)
         cleaned = TOOL_DEBUG_SELF_CLOSING_TAG_PATTERN.sub("", cleaned)
         cleaned = TOOI_CAIIS_TAG_PATTERN.sub("", cleaned, count=0)
         cleaned = TOOI_CAIIS_SELF_CLOSING_TAG_PATTERN.sub("", cleaned)
@@ -1220,6 +1321,59 @@ class AIClient:
             raise RuntimeError("AI 服务没有返回可用模型。")
         return models
 
+    def _toolless_nudge(
+        self,
+        working_messages: list[dict[str, object]],
+        tool_list: list[dict[str, object]],
+        known_tool_names: set[str],
+        assistant_message: dict[str, object],
+        should_stop: Callable[[], bool] | None,
+    ) -> tuple[dict[str, object], list] | None:
+        """模型首轮用文字承诺了操作、却没有发出工具调用时，重试一次找回调用。
+
+        仅当历史中已有工具结果（处于工具任务流程）时启用：把原始文本
+        和一条提醒补进上下文，非流式地重试一次。找回工具调用时返回
+        (响应, tool_calls)；否则返回 None，调用方回退为原始文本回复。
+        nudge 请求自身失败（限流、超时等）不影响本轮，同样返回 None。
+        """
+        if should_stop is not None and should_stop():
+            return None
+        content = assistant_message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        if not any(
+            isinstance(item, dict) and item.get("role") == "tool"
+            for item in working_messages
+        ):
+            return None
+        working_messages.append(
+            {
+                "role": "assistant",
+                "content": self._strip_tool_debug_markup(content),
+            }
+        )
+        working_messages.append(
+            {"role": "system", "content": TOOLLESS_NUDGE_PROMPT}
+        )
+        try:
+            retry_message = self._complete_message(
+                working_messages,
+                tools=tool_list,
+                on_event=None,
+                should_stop=should_stop,
+            )
+        except RuntimeError:
+            return None
+        tool_calls = retry_message.get("tool_calls")
+        if not tool_calls:
+            tool_calls = extract_text_tool_calls(
+                retry_message.get("content"),
+                known_tool_names,
+            )
+        if not tool_calls:
+            return None
+        return retry_message, tool_calls
+
     def complete_with_media_skills(
         self,
         messages: list[dict[str, object]],
@@ -1275,6 +1429,16 @@ class AIClient:
             and self.has_brainstorm_participants
         ):
             tool_list += [BRAINSTORM_TOOL]
+        known_tool_names: set[str] = set()
+        for entry in tool_list:
+            function = (
+                entry.get("function") if isinstance(entry, dict) else None
+            )
+            if (
+                isinstance(function, dict)
+                and isinstance(function.get("name"), str)
+            ):
+                known_tool_names.add(function["name"])
         def current_permanent_root() -> Path | None:
             if permanent_root_provider is not None:
                 return permanent_root_provider()
@@ -1299,6 +1463,21 @@ class AIClient:
                 should_stop=should_stop if should_stop is not None else None,
             )
             tool_calls = assistant_message.get("tool_calls")
+            if not tool_calls:
+                tool_calls = extract_text_tool_calls(
+                    assistant_message.get("content"),
+                    known_tool_names,
+                )
+            if not tool_calls and round_index == 0 and not forced_tool:
+                recovered = self._toolless_nudge(
+                    working_messages,
+                    tool_list,
+                    known_tool_names,
+                    assistant_message,
+                    should_stop,
+                )
+                if recovered is not None:
+                    assistant_message, tool_calls = recovered
             if not tool_calls:
                 if forced_tool and round_index == 0:
                     raise RuntimeError(
