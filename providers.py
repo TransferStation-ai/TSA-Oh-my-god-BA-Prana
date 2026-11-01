@@ -31,7 +31,7 @@ BUILTIN_PROVIDERS = (
     ),
     ProviderPreset(
         name="kimi（kimi官方）",
-        base_url="https://api.openai.com/v1",
+        base_url="https://api.moonshot.cn/v1",
         image_model="kimi-k3.1-pro",
         video_model="kimi-k3.1-pro",
     ),
