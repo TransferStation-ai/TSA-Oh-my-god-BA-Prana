@@ -254,3 +254,11 @@ class _StreamBuffer:
 | Tk 高频刷新卡顿 | 40ms 聚合泵 + 单 Label 覆盖写；每请求同时最多一个待处理 UI 回调 |
 | 工具轮次间文本归属 | 同气泡顺序追加，最终记录 `display` 与所见一致 |
 | 停止时内容丢失 | 停止前把部分文本显式落盘 |
+
+## 实现状态
+
+已实现（2026-11-01，分支 `feat/streaming-thinking`）：`streaming.py` 纯逻辑层、`ai_client` 流式请求与自动回退、`sessions` 的 `reasoning_blocks` 持久化、`main` 的 `ThinkingBlock` 折叠思考块与 `_StreamView` 增量渲染，以及回复/停止/失败三条收尾路径。
+
+- 观感对齐 OpenCode 桌面端 v1：生成中 `Thinking` + 实时小标题微光，结束后折叠为 `▸ Thought Xs`，点击展开灰色思考正文。
+- `reasoning_blocks` 随会话消息落盘，且**不进入 API 消息**（`build_api_messages` 不复制该字段）。
+- 旧会话兼容：没有 `reasoning_blocks` 的历史消息按原样渲染，不出现空思考块。
