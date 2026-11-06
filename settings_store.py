@@ -1,10 +1,59 @@
 import base64
 import ctypes
+from datetime import datetime
 import json
 import os
 import sys
 from ctypes import wintypes
 from pathlib import Path
+
+import providers
+
+
+DEFAULT_GAME_SETTINGS: dict[str, str] = {
+    "mc_name": "Prana",
+    "mc_skin_path": "",
+    "mc_skin_command": "",
+    "gmod_client_dir": "",
+    "gmod_model": "",
+}
+
+DEFAULT_MODELING_SETTINGS: dict[str, str] = {
+    "blender_path": "",
+    "blockbench_path": "",
+    "gmod_dir": "",
+    "sfm_dir": "",
+}
+
+
+def normalize_game(value: object) -> dict[str, str]:
+    if value is None:
+        return dict(DEFAULT_GAME_SETTINGS)
+    if not isinstance(value, dict):
+        raise ValueError("游戏设置格式无效。")
+    normalized = dict(DEFAULT_GAME_SETTINGS)
+    for key in normalized:
+        item = value.get(key, normalized[key])
+        if not isinstance(item, str):
+            raise ValueError("游戏设置格式无效。")
+        normalized[key] = item.strip()
+    if not normalized["mc_name"]:
+        normalized["mc_name"] = "Prana"
+    return normalized
+
+
+def normalize_modeling(value: object) -> dict[str, str]:
+    if value is None:
+        return dict(DEFAULT_MODELING_SETTINGS)
+    if not isinstance(value, dict):
+        raise ValueError("建模设置格式无效。")
+    normalized = dict(DEFAULT_MODELING_SETTINGS)
+    for key in normalized:
+        item = value.get(key, normalized[key])
+        if not isinstance(item, str):
+            raise ValueError("建模设置格式无效。")
+        normalized[key] = item.strip()
+    return normalized
 
 
 class _DataBlob(ctypes.Structure):
@@ -84,7 +133,11 @@ def _unprotect_api_key(encrypted: str) -> str:
 def load_settings() -> dict[str, object]:
     path = settings_file_path()
     if not path.exists():
-        return {}
+        return {
+            "provider_vault": {},
+            "game": normalize_game(None),
+            "modeling": normalize_modeling(None),
+        }
 
     try:
         contents = json.loads(path.read_text(encoding="utf-8"))
@@ -114,6 +167,60 @@ def load_settings() -> dict[str, object]:
             "model": model,
             "subagents": subagents,
         }
+        raw_vault = contents.get("provider_vault", {})
+        if not isinstance(raw_vault, dict):
+            raise ValueError("提供商库设置格式无效。")
+        provider_vault: dict[str, dict[str, object]] = {}
+        for key, raw_entry in raw_vault.items():
+            if not isinstance(key, str) or not isinstance(raw_entry, dict):
+                raise ValueError("提供商库设置格式无效。")
+            encrypted_key = raw_entry.get("api_key_enc", "")
+            if not isinstance(encrypted_key, str):
+                raise ValueError("提供商库 API Key 设置格式无效。")
+            models = raw_entry.get("models", [])
+            if not isinstance(models, list):
+                raise ValueError("提供商模型目录格式无效。")
+            normalized_models: list[dict[str, str]] = []
+            for model_entry in models:
+                if not isinstance(model_entry, dict):
+                    raise ValueError("提供商模型目录格式无效。")
+                model_id = model_entry.get("id")
+                model_name = model_entry.get("name", model_id)
+                if not isinstance(model_id, str) or not isinstance(model_name, str):
+                    raise ValueError("提供商模型目录格式无效。")
+                normalized_models.append({"id": model_id, "name": model_name})
+            entry: dict[str, object] = {
+                "name": raw_entry.get("name", ""),
+                "base_url": raw_entry.get("base_url", ""),
+                "api_key": (
+                    _unprotect_api_key(encrypted_key) if encrypted_key else ""
+                ),
+                "api_key_hint": raw_entry.get("api_key_hint", ""),
+                "model": raw_entry.get("model", ""),
+                "models": normalized_models,
+                "image_model": raw_entry.get("image_model", ""),
+                "video_model": raw_entry.get("video_model", ""),
+                "review_model": raw_entry.get("review_model", ""),
+                "updated_at": raw_entry.get("updated_at", ""),
+            }
+            if not all(
+                isinstance(entry[field], str)
+                for field in (
+                    "name",
+                    "base_url",
+                    "api_key_hint",
+                    "model",
+                    "image_model",
+                    "video_model",
+                    "review_model",
+                    "updated_at",
+                )
+            ):
+                raise ValueError("提供商库设置格式无效。")
+            provider_vault[key] = entry
+        settings["provider_vault"] = provider_vault
+        settings["game"] = normalize_game(contents.get("game"))
+        settings["modeling"] = normalize_modeling(contents.get("modeling"))
         for field in ("image_model", "video_model"):
             value = contents.get(field)
             if value is not None:
@@ -172,8 +279,54 @@ def save_settings(
     review_model: str | None = None,
     brainstorm_rounds: int | None = None,
     linked_providers: list[dict[str, object]] | None = None,
-) -> None:
+    provider_vault: dict[str, dict[str, object]] | None = None,
+    vault_models: list[dict[str, str]] | None = None,
+    vault_key: str | None = None,
+    game: dict[str, object] | None = None,
+    modeling: dict[str, object] | None = None,
+) -> dict[str, dict[str, object]]:
     path = settings_file_path()
+    key = vault_key or providers.resolve_main_vault_key(base_url)
+    vault = {
+        entry_key: dict(entry)
+        for entry_key, entry in (provider_vault or {}).items()
+    }
+    entry = dict(vault.get(key) or {})
+    preset = next(
+        (item for item in providers.BUILTIN_PROVIDERS if item.matches(base_url)),
+        None,
+    )
+    entry.update(
+        {
+            "base_url": providers.normalize_base_url(base_url),
+            "api_key": api_key,
+            "api_key_hint": providers.make_key_hint(api_key),
+            "model": model,
+            "models": (
+                [dict(item) for item in vault_models]
+                if vault_models is not None
+                else entry.get("models", [])
+            ),
+            "image_model": (
+                image_model if image_model is not None else entry.get("image_model", "")
+            ),
+            "video_model": (
+                video_model if video_model is not None else entry.get("video_model", "")
+            ),
+            "review_model": (
+                review_model if review_model is not None else entry.get("review_model", "")
+            ),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    if not entry.get("name"):
+        entry["name"] = (
+            preset.name
+            if preset is not None
+            else f"自定义 {providers.make_key_hint(api_key)}"
+        )
+    vault[key] = entry
+
     contents = {
         "api_key": _protect_api_key(api_key),
         "base_url": base_url,
@@ -182,6 +335,23 @@ def save_settings(
             {**agent, "api_key": _protect_api_key(str(agent["api_key"]))}
             for agent in (subagents or [])
         ],
+        "provider_vault": {
+            entry_key: {
+                **{
+                    field: value
+                    for field, value in stored_entry.items()
+                    if field not in {"api_key", "api_key_enc"}
+                },
+                "api_key_enc": _protect_api_key(
+                    str(stored_entry.get("api_key", ""))
+                )
+                if stored_entry.get("api_key")
+                else "",
+            }
+            for entry_key, stored_entry in vault.items()
+        },
+        "game": normalize_game(game),
+        "modeling": normalize_modeling(modeling),
     }
     if image_model is not None:
         contents["image_model"] = image_model
@@ -219,3 +389,4 @@ def save_settings(
         temporary_path.replace(path)
     except OSError as error:
         raise RuntimeError(f"无法保存 Prana 设置文件：{error}") from error
+    return vault
