@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+/.superpowers/
 /build/
 /dist/
 /*.spec
