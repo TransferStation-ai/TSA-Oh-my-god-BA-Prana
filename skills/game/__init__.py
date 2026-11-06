@@ -4,6 +4,10 @@ import json
 import math
 import re
 from typing import Protocol
+from skills.game.wiki import (
+    MINECRAFT_WIKI_SKILLS,
+    invoke_minecraft_wiki_skill,
+)
 
 MC_GAME = "mc"
 PLAYER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,16}$")
@@ -15,11 +19,14 @@ GAME_COMMAND_ACTIONS = (
     "msg",
     "stop",
     "status",
+    "scan",
     "mine",
+    "craft",
     "inventory",
     "equip",
     "move",
     "eat",
+    "use",
     "interact",
     "place",
     "attack",
@@ -30,10 +37,21 @@ GAME_SKILLS: list[dict[str, object]] = [
         "type": "function",
         "function": {
             "name": "probe_game_server",
-            "description": "探测本机是否有 Minecraft Java 服务器。",
+            "description": (
+                "探测本机默认 Minecraft Java 端口；可传入老师提供的本机端口"
+                "探测自定义端口。只探测 127.0.0.1。"
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"game": {"type": "string", "enum": ["mc"]}},
+                "properties": {
+                    "game": {"type": "string", "enum": ["mc"]},
+                    "port": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535,
+                        "description": "可选的本机 Minecraft 服务器端口。",
+                    },
+                },
                 "required": ["game"],
                 "additionalProperties": False,
             },
@@ -51,7 +69,13 @@ GAME_SKILLS: list[dict[str, object]] = [
                     "host": {"type": "string"},
                     "port": {"type": "integer"},
                     "player_name": {"type": "string"},
-                    "version": {"type": "string"},
+                    "version": {
+                        "type": "string",
+                        "description": (
+                            "可选；只在用户提供或服务器探测到版本时填写，"
+                            "否则省略以自动检测。"
+                        ),
+                    },
                 },
                 "required": ["game", "host", "port"],
                 "additionalProperties": False,
@@ -78,6 +102,8 @@ GAME_SKILLS: list[dict[str, object]] = [
                     "x": {"type": "number"},
                     "y": {"type": "number"},
                     "z": {"type": "number"},
+                    "max_distance": {"type": "integer", "minimum": 1, "maximum": 64},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 64},
                     "kind": {"type": "string", "enum": ["block", "entity"]},
                 },
                 "required": ["game", "action"],
@@ -102,7 +128,9 @@ GAME_SKILLS: list[dict[str, object]] = [
 
 
 class GameSessionAccess(Protocol):
-    def probe(self, game: str) -> dict[str, object]: ...
+    def probe(
+        self, game: str, port: int | None = None
+    ) -> dict[str, object]: ...
 
     def join(
         self,
@@ -126,6 +154,8 @@ class GameSessionAccess(Protocol):
         y: float | None = None,
         z: float | None = None,
         kind: str = "",
+        max_distance: int = 24,
+        count: int = 1,
     ) -> dict[str, object]: ...
 
     def leave(self, game: str) -> dict[str, object]: ...
@@ -137,7 +167,7 @@ def validate_game_skill_arguments(name: str, arguments: object) -> None:
     if not isinstance(arguments, dict):
         raise ValueError("游戏 skill 参数必须是对象。")
     schemas = {
-        "probe_game_server": {"game"},
+        "probe_game_server": {"game", "port"},
         "join_game": {"game", "host", "port", "player_name", "version"},
         "game_command": {
             "game",
@@ -149,6 +179,8 @@ def validate_game_skill_arguments(name: str, arguments: object) -> None:
             "x",
             "y",
             "z",
+            "max_distance",
+            "count",
             "kind",
         },
         "leave_game": {"game"},
@@ -162,7 +194,16 @@ def validate_game_skill_arguments(name: str, arguments: object) -> None:
     if arguments["game"] != MC_GAME:
         raise ValueError('一期只支持 Minecraft（game 必须为 "mc"）。')
 
-    if name == "join_game":
+    if name == "probe_game_server":
+        if "port" in arguments:
+            port = arguments["port"]
+            if (
+                isinstance(port, bool)
+                or not isinstance(port, int)
+                or not 1 <= port <= 65535
+            ):
+                raise ValueError("端口必须在 1-65535 之间。")
+    elif name == "join_game":
         if not isinstance(arguments.get("host"), str) or not arguments["host"].strip():
             raise ValueError("服务器地址不能为空。")
         port = arguments.get("port")
@@ -187,17 +228,23 @@ def validate_game_skill_arguments(name: str, arguments: object) -> None:
             "msg": {"target", "text"},
             "stop": set(),
             "status": set(),
+            "scan": {"max_distance"},
             "mine": {"block"},
+            "craft": {"item", "count"},
             "inventory": set(),
             "equip": {"item"},
             "move": {"x", "y", "z"},
             "eat": {"item"},
+            "use": {"item"},
             "interact": {"target", "kind"},
             "place": {"item", "x", "y", "z"},
             "attack": {"target"},
         }
         supplied_fields = set(arguments) - {"game", "action"}
-        if supplied_fields - action_fields[action]:
+        invalid_fields = supplied_fields - action_fields[action]
+        if "count" in invalid_fields:
+            raise ValueError("游戏 skill 包含未知参数。")
+        if invalid_fields:
             raise ValueError("游戏动作包含不适用的参数。")
 
         target = arguments.get("target", "")
@@ -219,7 +266,22 @@ def validate_game_skill_arguments(name: str, arguments: object) -> None:
             block = arguments.get("block")
             if not isinstance(block, str) or MC_ITEM_PATTERN.fullmatch(block) is None:
                 raise ValueError("采矿需要有效的方块注册名。")
-        if action in {"equip", "eat", "place"}:
+        if action == "craft":
+            item = arguments.get("item")
+            if not isinstance(item, str) or MC_ITEM_PATTERN.fullmatch(item) is None:
+                raise ValueError("合成需要有效的物品注册名。")
+            count = arguments.get("count", 1)
+            if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 64:
+                raise ValueError("合成数量必须是 1 到 64 之间的整数。")
+        if action == "scan":
+            distance = arguments.get("max_distance", 24)
+            if (
+                isinstance(distance, bool)
+                or not isinstance(distance, int)
+                or not 1 <= distance <= 64
+            ):
+                raise ValueError("扫描距离必须是 1 到 64 格之间的整数。")
+        if action in {"equip", "eat", "use", "place"}:
             item = arguments.get("item")
             if not isinstance(item, str) or MC_ITEM_PATTERN.fullmatch(item) is None:
                 raise ValueError("此动作需要有效的物品注册名。")
@@ -253,7 +315,7 @@ def invoke_game_skill(
         raise ValueError("游戏 skill 参数必须是对象。")
     game = str(arguments["game"])
     if name == "probe_game_server":
-        result = access.probe(game)
+        result = access.probe(game, arguments.get("port"))
     elif name == "join_game":
         result = access.join(
             game,
@@ -267,9 +329,7 @@ def invoke_game_skill(
         if action == "status":
             result = access.status(game)
         else:
-            result = access.command(
-                game,
-                action,
+            command_arguments: dict[str, object] = dict(
                 target=str(arguments.get("target", "")),
                 text=str(arguments.get("text", "")),
                 block=str(arguments.get("block", "")),
@@ -279,6 +339,13 @@ def invoke_game_skill(
                 z=arguments.get("z"),
                 kind=str(arguments.get("kind", "")),
             )
+            if action == "scan":
+                command_arguments["max_distance"] = arguments.get(
+                    "max_distance", 24
+                )
+            elif action == "craft":
+                command_arguments["count"] = arguments.get("count", 1)
+            result = access.command(game, action, **command_arguments)
     else:
         result = access.leave(game)
     return json.dumps(result, ensure_ascii=False)
@@ -287,6 +354,8 @@ def invoke_game_skill(
 __all__ = [
     "GAME_SKILLS",
     "GameSessionAccess",
+    "MINECRAFT_WIKI_SKILLS",
+    "invoke_minecraft_wiki_skill",
     "invoke_game_skill",
     "validate_game_skill_arguments",
 ]

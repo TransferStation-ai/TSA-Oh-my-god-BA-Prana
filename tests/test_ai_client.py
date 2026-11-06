@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import ai_client
 from ai_client import AIClient, extract_text_tool_calls
 
 
@@ -1062,6 +1063,7 @@ class AIClientTests(unittest.TestCase):
                 "switch_workspace",
                 "read_git_repository",
                 "run_shell_command",
+                "search_minecraft_wiki",
             ],
         )
         self.assertEqual(
@@ -3635,7 +3637,8 @@ class ToollessNudgeTests(unittest.TestCase):
         arguments = {
             "game": "mc",
             "host": "127.0.0.1",
-            "port": 25565,
+            "port": 55460,
+            "version": "1.20.1",
         }
         with patch.object(
             client,
@@ -3653,7 +3656,14 @@ class ToollessNudgeTests(unittest.TestCase):
             "ai_client.invoke_game_skill", return_value='{"ok":true}'
         ) as invoke:
             client.complete_with_media_skills(
-                [{"role": "user", "content": "陪我玩"}],
+                [
+                    {
+                        "role": "user",
+                        "content": "加入端口 55460 的本地 Minecraft 服务器并陪我通关",
+                    },
+                    {"role": "assistant", "content": "好的。"},
+                    {"role": "user", "content": "版本是 1.20.1"},
+                ],
                 game_session=object(),
             )
         review.assert_called_once()
@@ -3662,7 +3672,44 @@ class ToollessNudgeTests(unittest.TestCase):
         self.assertEqual(
             payload["proposed_operation"]["arguments"], arguments
         )
+        self.assertEqual(
+            payload["recent_user_context"],
+            ["加入端口 55460 的本地 Minecraft 服务器并陪我通关"],
+        )
         invoke.assert_called_once()
+
+    def test_game_skill_review_uses_operation_reviewer(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+                "review_model": "review-model",
+            }
+        )
+        operation = {
+            "name": "prepare_mining",
+            "description": "下矿前准备",
+            "source": "def run(api):\n    api.scan()\n",
+            "steps": [{"action": "scan"}],
+        }
+        messages = [{"role": "user", "content": "准备下矿"}]
+        with patch.object(
+            client, "_review_sensitive_operation"
+        ) as review:
+            client.review_game_skill(operation, messages)
+
+        review.assert_called_once()
+        self.assertEqual(review.call_args.args[:3], (
+            "mc_create_skill",
+            operation,
+            messages,
+        ))
+        self.assertIn("MC 动作序列", review.call_args.kwargs["effect"])
+        self.assertEqual(
+            review.call_args.kwargs["system_prompt"],
+            ai_client.GAME_SKILL_REVIEW_SYSTEM_PROMPT,
+        )
 
     def test_game_command_skips_review_and_tools_require_session(self) -> None:
         client = self._client()

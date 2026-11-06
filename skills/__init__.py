@@ -32,6 +32,8 @@ from skills.git import GIT_SKILLS, invoke_git_skill, validate_git_arguments
 from skills.game import (
     GAME_SKILLS,
     GameSessionAccess,
+    MINECRAFT_WIKI_SKILLS,
+    invoke_minecraft_wiki_skill,
     invoke_game_skill,
     validate_game_skill_arguments,
 )
@@ -49,6 +51,7 @@ __all__ = [
     "GIT_SKILLS",
     "GAME_SKILLS",
     "GameSessionAccess",
+    "MINECRAFT_WIKI_SKILLS",
     "MEDIA_SKILLS",
     "MODELING_SKILLS",
     "ModelingSessionAccess",
@@ -60,6 +63,7 @@ __all__ = [
     "invoke_desktop_skill",
     "invoke_git_skill",
     "invoke_game_skill",
+    "invoke_minecraft_wiki_skill",
     "invoke_media_skill",
     "invoke_modeling_skill",
     "invoke_qq_music_skill",

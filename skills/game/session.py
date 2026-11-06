@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import threading
 from typing import Callable
 
 from skills.game.agent import GameBrain
+from skills.game.custom_skills import GameSkillStore
 from skills.game.mc import (
     McBody,
     McBodyError,
@@ -33,6 +35,10 @@ class GameSession:
             dict[str, object],
         ],
         on_event: Callable[[str, dict[str, object]], None],
+        review_skill: Callable[
+            [dict[str, object], list[dict[str, object]]], None
+        ]
+        | None = None,
         body_factory: Callable[..., McBody] | None = None,
         body_command: list[str] | None = None,
     ) -> None:
@@ -40,6 +46,8 @@ class GameSession:
         self.data_dir = Path(data_dir)
         self.complete = complete
         self.on_event = on_event
+        self.review_skill = review_skill
+        self.custom_skills = GameSkillStore(self.data_dir / "game_skills")
         self.body_factory = body_factory or McBody
         self.body_command = body_command
         self.body: McBody | None = None
@@ -51,10 +59,22 @@ class GameSession:
     def active_game(self) -> str | None:
         return self._active_game
 
-    def probe(self, game: str) -> dict[str, object]:
+    def probe(
+        self, game: str, port: int | None = None
+    ) -> dict[str, object]:
         if game != "mc":
             raise ValueError("一期只支持 Minecraft。")
-        servers = detect_local_mc()
+        if port is not None and (
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError("端口必须在 1-65535 之间。")
+        servers = (
+            detect_local_mc()
+            if port is None
+            else detect_local_mc((port,))
+        )
         return {
             "found": bool(servers),
             "servers": servers,
@@ -117,6 +137,8 @@ class GameSession:
                     complete=self.complete,
                     execute=self._execute_action,
                     on_say=body.say,
+                    create_skill=self._create_custom_skill,
+                    custom_skill_tools=self.custom_skills.tool_schemas,
                     on_error=lambda message: self.on_event(
                         "error", {"message": message}
                     ),
@@ -174,6 +196,15 @@ class GameSession:
         body = self.body
         if body is None:
             return "游戏本体当前未运行。"
+        if name == "mc_run_skill":
+            if set(arguments) != {"name"} or not isinstance(
+                arguments.get("name"), str
+            ):
+                raise ValueError("运行技能需要且只能指定技能名称。")
+            results = self.custom_skills.run(
+                arguments["name"], self._execute_action
+            )
+            return json.dumps(results, ensure_ascii=False)
         if name == "mc_follow":
             body.follow(str(arguments.get("target", "")))
         elif name == "mc_say":
@@ -185,9 +216,20 @@ class GameSession:
             )
         elif name == "mc_stop":
             body.stop_follow()
+        elif name == "mc_scan":
+            result = body.scan(
+                max_distance=arguments.get("max_distance", 24)
+            )
+            return json.dumps(result, ensure_ascii=False)
         elif name == "mc_mine":
             result = body.mine(str(arguments.get("block", "")))
             return str(result.get("message", "采矿已完成。"))
+        elif name == "mc_craft":
+            result = body.craft(
+                str(arguments.get("item", "")),
+                arguments.get("count", 1),
+            )
+            return str(result.get("message", "合成已完成。"))
         elif name == "mc_inventory":
             items = body.inventory()
             if not items:
@@ -207,6 +249,9 @@ class GameSession:
             return str(result.get("message", "已到达目标坐标。"))
         elif name == "mc_eat":
             body.eat(str(arguments.get("item", "")))
+        elif name == "mc_use":
+            result = body.use(str(arguments.get("item", "")))
+            return str(result.get("message", f"已使用 {arguments.get('item', '')}。"))
         elif name == "mc_interact":
             body.interact(
                 str(arguments.get("target", "")),
@@ -225,6 +270,32 @@ class GameSession:
             return "不允许执行此游戏动作。"
         return "已执行。"
 
+    def _create_custom_skill(
+        self,
+        arguments: dict[str, object],
+        messages: list[dict[str, object]],
+    ) -> str:
+        if set(arguments) != {"name", "description", "source"}:
+            raise ValueError("创建技能需要且只能提供名称、描述和代码。")
+        if not all(
+            isinstance(arguments.get(field), str)
+            for field in ("name", "description", "source")
+        ):
+            raise ValueError("技能名称、描述和代码必须是文本。")
+        if self.review_skill is None:
+            raise RuntimeError("未配置操作审查模型，不能创建 MC 技能。")
+        result = self.custom_skills.create(
+            name=arguments["name"],
+            description=arguments["description"],
+            source=arguments["source"],
+            review=self.review_skill,
+            messages=messages,
+        )
+        return json.dumps(
+            {"status": "saved", **result},
+            ensure_ascii=False,
+        )
+
     def command(
         self,
         game: str,
@@ -238,6 +309,8 @@ class GameSession:
         y: float | None = None,
         z: float | None = None,
         kind: str = "",
+        max_distance: int = 24,
+        count: int = 1,
     ) -> dict[str, object]:
         if game != self._active_game or game != "mc":
             raise GameSessionError("当前没有运行中的 Minecraft 会话。")
@@ -252,8 +325,14 @@ class GameSession:
             body.msg(target, text)
         elif action == "stop":
             body.stop_follow()
+        elif action == "scan":
+            result = body.scan(max_distance=max_distance)
+            return {"ok": True, "action": action, **result}
         elif action == "mine":
             result = body.mine(block)
+            return {"ok": True, "action": action, **result}
+        elif action == "craft":
+            result = body.craft(item, count)
             return {"ok": True, "action": action, **result}
         elif action == "inventory":
             return {"ok": True, "action": action, "items": body.inventory()}
@@ -264,6 +343,9 @@ class GameSession:
             return {"ok": True, "action": action, **result}
         elif action == "eat":
             body.eat(item)
+        elif action == "use":
+            result = body.use(item)
+            return {"ok": True, "action": action, **result}
         elif action == "interact":
             body.interact(target, kind)
         elif action == "place":

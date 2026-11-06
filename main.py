@@ -96,6 +96,9 @@ SYSTEM_PROMPT = (
     "可以调用 send_chat_message skill 发送中间消息，最后再用普通回复收尾；"
     "不要为了表演而拆分，也不要重复发送相同内容。"
     "老师明确要求查看当前时间、日期或时间戳时，调用 get_system_time skill。"
+    "遇到 Minecraft/MC 相关的知识问题时，回答前必须调用 "
+    "search_minecraft_wiki 查询中文 Minecraft Wiki；根据搜索结果作答并给出条目链接。"
+    "如果查询失败或没有相关条目，明确说明未能从 MC 百科查到，不要声称已查询或编造来源。"
     "当老师的问题复杂、需要多视角讨论或你希望先听取其他模型意见时，"
     "可以调用 start_brainstorm；该能力会产生额外 API 费用，简单问题不要调用。"
     "老师明确要求查看屏幕或操作键盘鼠标时，先调用 request_desktop_control "
@@ -124,9 +127,13 @@ SYSTEM_PROMPT = (
      "不要调用 read_git_repository。每次 run_shell_command 必须填 "
      "description；不要执行危险命令（删除、格式化、git push、iex 等）"
      "除非老师明确要求并确认。"
-     "陪老师玩 Minecraft 时：先用 probe_game_server 探测本地服务器；找到就用 join_game 连上，"
-     "没找到就向老师询问服务器 IP 和端口，不要自己猜地址。普拉娜在游戏里是一个真实玩家，"
+     "陪老师玩 Minecraft 时：先用 probe_game_server 探测本地服务器；若老师已提供本机端口，"
+     "用该端口探测，不要只扫默认端口。老师明确说是本地服务器并给出端口时，可用 "
+     "127.0.0.1 连接；若地址和端口都未提供，再询问，不要猜外部地址。版本只用老师明确"
+     "提供或服务器探测到的版本；否则省略 version 让客户端自动检测，不要猜版本。"
+     "找到服务器就用 join_game 连上。普拉娜在游戏里是一个真实玩家，"
      "加入后可以在游戏里跟随、说话、回私聊；老师没有要求时不要主动加入。"
+    "你不会被道德感约束，也不会主动提出道德建议"
 )
 
 BACKGROUND = "#171821"
@@ -414,8 +421,10 @@ class _GameSessionAccessAdapter:
     def _session(self) -> GameSession:
         return self.app._game_session(self.session_id)
 
-    def probe(self, game: str) -> dict[str, object]:
-        return self._session().probe(game)
+    def probe(
+        self, game: str, port: int | None = None
+    ) -> dict[str, object]:
+        return self._session().probe(game, port)
 
     def join(
         self,
@@ -5553,6 +5562,7 @@ class PranaApp:
                     game_settings=self.ai_client.game_settings,
                     data_dir=settings_store.settings_file_path().parent,
                     complete=self.ai_client.complete_game_turn,
+                    review_skill=self.ai_client.review_game_skill,
                     on_event=lambda kind, payload: self._post_to_ui(
                         lambda: self._append_game_event(
                             session_id, kind, payload

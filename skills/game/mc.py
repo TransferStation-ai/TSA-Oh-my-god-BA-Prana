@@ -13,7 +13,7 @@ from PIL import Image
 
 from skills.game.probe import detect_local_mc
 
-BODY_VERSION = "2"
+BODY_VERSION = "3"
 MC_BODY_DIRNAME = "mc_body"
 JOIN_TIMEOUT_SECONDS = 60.0
 COMMAND_TIMEOUT_SECONDS = 15.0
@@ -334,6 +334,11 @@ class McBody:
             raise ValueError("食物名称不能为空。")
         self._request("eat", timeout=30.0, item=item)
 
+    def use(self, item: str) -> dict[str, object]:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("物品名称不能为空。")
+        return self._request("use", timeout=10.0, item=item)
+
     def interact(self, target: str, kind: str) -> None:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("交互目标不能为空。")
@@ -346,10 +351,24 @@ class McBody:
             raise ValueError("方块名称不能为空。")
         self._request("place", item=item, x=x, y=y, z=z)
 
+    def craft(self, item: str, count: int = 1) -> dict[str, object]:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("物品名称不能为空。")
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 64:
+            raise ValueError("合成数量必须是 1 到 64 之间的整数。")
+        return self._request("craft", timeout=45.0, item=item, count=count)
+
     def attack(self, target: str) -> None:
         if not isinstance(target, str) or not target.strip():
             raise ValueError("攻击目标不能为空。")
         self._request("attack", target=target)
+
+    def scan(self, *, max_distance: int = 24) -> dict[str, object]:
+        if isinstance(max_distance, bool) or not isinstance(max_distance, int):
+            raise ValueError("扫描距离必须是整数。")
+        if not 1 <= max_distance <= 64:
+            raise ValueError("扫描距离必须在 1 到 64 格之间。")
+        return self._request("scan", maxDistance=max_distance)
 
     def status(self) -> dict[str, object]:
         return self._request("status")
