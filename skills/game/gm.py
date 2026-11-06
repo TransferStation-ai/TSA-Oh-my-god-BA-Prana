@@ -274,6 +274,118 @@ class GmConsole:
             self._closed = True
 
 
+def gm_join_script(player_model: str = "", npc_name: str = "普拉娜") -> str:
+    """单行 Lua：生成/复用 NPC，entindex 存于全局 PRUNA_NPC；
+
+    首调 spawn ``npc_gunman``（给定模型则 SetModel），SetName(npc_name)；
+    注入 ``ChatPlayer`` 钩子把游戏内聊天以 ``PRANA_GM_CHAT`` 前缀回传；
+    末行打印 ``PRANA_GM_ACK``。重复 join 不重复 spawn（复用已存 entindex）。
+    """
+    model_json = json.dumps(player_model, ensure_ascii=False)
+    name_json = json.dumps(npc_name, ensure_ascii=False)
+    return (
+        'if not(PRUNA_NPC and IsValid(Entity(PRUNA_NPC))) then '
+        'local npc=ents.Create("npc_gunman"); '
+        'if IsValid(LocalPlayer()) then '
+        "npc:SetPos(LocalPlayer():GetPos()+Vector(0,0,64)) end; "
+        "npc:Spawn(); "
+        "npc:SetName(" + name_json + "); "
+        "if " + model_json + '~="" then npc:SetModel(' + model_json + ") end; "
+        "PRUNA_NPC=npc:EntIndex() end; "
+        'hook.Add("ChatPlayer","PranaGameHook",function(player,text) '
+        'print("PRANA_GM_CHAT "..player:Nick().." | "..text) end); '
+        'print("PRANA_GM_ACK")'
+    )
+
+
+def gm_say_script(text: str) -> str:
+    """让 NPC 名义发言：``PlayerSay`` 单参广播（签名待任务 7 校准）；
+    ``text`` 以 JSON 字符串字面量嵌入，避免引号注入；末行 ACK。"""
+    text_json = json.dumps(text, ensure_ascii=False)
+    return "PlayerSay(" + text_json + '); print("PRANA_GM_ACK")'
+
+
+def gm_follow_script(target: str) -> str:
+    """注入/更新 ``Think`` 钩子（每 30 帧一跳）：NPC 朝目标玩家水平移动；
+    距离 > 2 单位才移动，≤2 单位停；目标为玩家 Nick 或 "老师"（本地玩家）；
+    重复调用重设目标（全局 PRUNA_FOLLOW_TARGET）；末行 ACK。"""
+    target_json = json.dumps(target, ensure_ascii=False)
+    return (
+        "PRUNA_FOLLOW_TARGET=" + target_json + "; "
+        "PRUNA_FOLLOW_TICK=0; "
+        "function PranaFollowThink() "
+        "PRUNA_FOLLOW_TICK=(PRUNA_FOLLOW_TICK or 0)+1; "
+        "if PRUNA_FOLLOW_TICK%30~=0 then return end; "
+        "local npc=Entity(PRUNA_NPC); if not IsValid(npc) then return end; "
+        "local goal; "
+        'if PRUNA_FOLLOW_TARGET=="老师" then goal=LocalPlayer() '
+        "else goal=nil; "
+        "for _,p in ipairs(player.GetAll()) do "
+        "if p:Nick()==PRUNA_FOLLOW_TARGET then goal=p; break end end end; "
+        "if not IsValid(goal) then return end; "
+        "local d=goal:GetPos()-npc:GetPos(); "
+        "local len=math.sqrt(d.x*d.x+d.y*d.y); "
+        "if len<=2.0 then return end; "
+        "npc:SetVelocity(Vector(d.x/len*300,d.y/len*300,0)); "
+        "npc:SetAngles(Angle(0,math.deg(math.atan2(d.y,d.x)),0)) end; "
+        'hook.Add("Think","PranaGameFollow",PranaFollowThink); '
+        'print("PRANA_GM_ACK")'
+    )
+
+
+def gm_stop_script() -> str:
+    """取消移动 ``Think`` 钩子，NPC 原地停留；末行 ACK。"""
+    return (
+        'hook.Remove("Think","PranaGameFollow"); '
+        "PRUNA_FOLLOW_TICK=0; "
+        "local npc=Entity(PRUNA_NPC); if IsValid(npc) then "
+        "npc:SetVelocity(Vector(0,0,0)) end; "
+        'print("PRANA_GM_ACK")'
+    )
+
+
+def gm_scan_script(max_players: int = 8) -> str:
+    """收集 NPC 位置 + 至多 ``max_players`` 名玩家（Nick/HP/SteamID），
+    ``print("PRANA_GM_JSON " .. json.encode(out))`` 回传解析；末行 ACK。"""
+    bound = int(max_players)
+    return (
+        "local out={players={}}; "
+        "local npc=Entity(PRUNA_NPC); "
+        "if IsValid(npc) then local p=npc:GetPos(); "
+        "out.npc={x=p.x,y=p.y,z=p.z} end; "
+        "local all=player.GetAll(); "
+        "for i=1,math.min(#all," + str(bound) + ") do local pl=all[i]; "
+        "out.players[i]={nick=pl:Nick(),hp=pl:Health(),"
+        'steamid=tostring(pl:SteamID())} end; '
+        'print("PRANA_GM_JSON "..json.encode(out)); '
+        'print("PRANA_GM_ACK")'
+    )
+
+
+def gm_leave_script() -> str:
+    """移除 ``ChatPlayer``/``Think`` 钩子，移除 NPC 实体，清全局变量；末行 ACK。"""
+    return (
+        'hook.Remove("ChatPlayer","PranaGameHook"); '
+        'hook.Remove("Think","PranaGameFollow"); '
+        "if PRUNA_NPC and IsValid(Entity(PRUNA_NPC)) then "
+        "Entity(PRUNA_NPC):Remove() end; "
+        "PRUNA_NPC=nil; PRUNA_FOLLOW_TARGET=nil; PRUNA_FOLLOW_TICK=0; "
+        'print("PRANA_GM_ACK")'
+    )
+
+
+def run_lua_snippet(console: GmConsole, script: str) -> dict[str, object]:
+    """把单行 Lua 片段经 ``lua_run`` 注入：``console.run("lua_run " + script)``。
+
+    ``script`` 不得包含换行（``lua_run`` 单行约束），违反则抛 ``ValueError``。
+    """
+    if not isinstance(script, str):
+        raise ValueError("lua_run 片段必须是字符串。")
+    if "\n" in script:
+        raise ValueError("lua_run 片段必须为单行（不能包含换行）。")
+    return console.run("lua_run " + script)
+
+
 __all__ = [
     "GM_CMD_TIMEOUT",
     "GM_CONNECT_TIMEOUT",
@@ -287,4 +399,11 @@ __all__ = [
     "GmProbeError",
     "a2s_info",
     "detect_local_gm",
+    "gm_follow_script",
+    "gm_join_script",
+    "gm_leave_script",
+    "gm_say_script",
+    "gm_scan_script",
+    "gm_stop_script",
+    "run_lua_snippet",
 ]
