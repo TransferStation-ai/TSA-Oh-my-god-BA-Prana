@@ -29,13 +29,29 @@ from skills.workspace import (
     validate_workspace_skill_arguments,
 )
 from skills.git import GIT_SKILLS, invoke_git_skill, validate_git_arguments
+from skills.game import (
+    GAME_SKILLS,
+    GameSessionAccess,
+    invoke_game_skill,
+    validate_game_skill_arguments,
+)
+from skills.modeling import (
+    MODELING_SKILLS,
+    ModelingSessionAccess,
+    invoke_modeling_skill,
+    validate_modeling_skill_arguments,
+)
 
 __all__ = [
     "CHAT_SKILLS",
     "DESKTOP_SKILLS",
     "DesktopAccess",
     "GIT_SKILLS",
+    "GAME_SKILLS",
+    "GameSessionAccess",
     "MEDIA_SKILLS",
+    "MODELING_SKILLS",
+    "ModelingSessionAccess",
     "QQ_MUSIC_SKILLS",
     "SHELL_SKILLS",
     "TERMINAL_SKILLS",
@@ -43,7 +59,9 @@ __all__ = [
     "WORKSPACE_SKILLS",
     "invoke_desktop_skill",
     "invoke_git_skill",
+    "invoke_game_skill",
     "invoke_media_skill",
+    "invoke_modeling_skill",
     "invoke_qq_music_skill",
     "invoke_shell_skill",
     "invoke_system_time_skill",
@@ -53,6 +71,8 @@ __all__ = [
     "validate_desktop_arguments",
     "validate_desktop_authorization_arguments",
     "validate_git_arguments",
+    "validate_game_skill_arguments",
+    "validate_modeling_skill_arguments",
     "validate_qq_music_arguments",
     "validate_system_time_arguments",
     "validate_shell_command",
