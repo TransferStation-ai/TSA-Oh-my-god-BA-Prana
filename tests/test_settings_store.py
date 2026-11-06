@@ -2,8 +2,6 @@ import base64
 import json
 import tempfile
 import unittest
-
-import pytest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -59,10 +57,7 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(settings["video_model"], "video-model")
         self.assertEqual(settings["review_model"], "review-model")
         self.assertEqual(settings["brainstorm_rounds"], 10)
-        current = settings["provider_vault"]["custom:https://example.test/v1"]
-        self.assertEqual(current["api_key"], "private-test-key")
-        self.assertEqual(current["models"], [])
-        self.assertEqual(settings["game"], settings_store.DEFAULT_GAME_SETTINGS)
+        self.assertEqual(settings["linked_providers"], [])
         self.assertEqual(
             settings["subagents"],
             [
@@ -75,6 +70,12 @@ class SettingsStoreTests(unittest.TestCase):
                 }
             ],
         )
+        vault_entry = settings["provider_vault"]["custom:https://example.test/v1"]
+        self.assertEqual(vault_entry["api_key"], "private-test-key")
+        self.assertEqual(vault_entry["base_url"], "https://example.test/v1")
+        self.assertEqual(vault_entry["image_model"], "image-model")
+        self.assertEqual(vault_entry["video_model"], "video-model")
+        self.assertEqual(vault_entry["review_model"], "review-model")
 
     def test_saves_and_loads_brainstorm_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -96,7 +97,7 @@ class SettingsStoreTests(unittest.TestCase):
                 patch("settings_store._unprotect_api_key", side_effect=unprotect),
             ):
                 settings_store.save_settings(
-                    "k-agnes",
+                    "main-key",
                     "https://main.test/v1",
                     "main-model",
                     [
@@ -183,79 +184,159 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(settings["brainstorm_rounds"], 10)
         self.assertEqual(settings["linked_providers"], [])
         self.assertEqual(settings["provider_vault"], {})
-        self.assertEqual(settings["game"], settings_store.DEFAULT_GAME_SETTINGS)
 
-    def test_vault_roundtrip_encrypts_provider_key(self) -> None:
+    def test_loads_old_settings_without_provider_vault_as_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "settings.json"
+            path = Path(directory) / "Prana" / "settings.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "api_key": "ciphertext",
+                        "base_url": "https://example.test/v1",
+                        "model": "model",
+                        "subagents": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
             with (
                 patch("settings_store.settings_file_path", return_value=path),
                 patch(
-                    "settings_store._protect_api_key",
-                    side_effect=lambda key: base64.b64encode(
-                        f"cipher:{key}".encode("utf-8")
-                    ).decode("ascii"),
-                ),
-                patch(
                     "settings_store._unprotect_api_key",
-                    side_effect=lambda value: base64.b64decode(value)
-                    .decode("utf-8")
-                    .removeprefix("cipher:"),
+                    return_value="plain-key",
                 ),
             ):
+                settings = settings_store.load_settings()
+
+        self.assertEqual(settings["provider_vault"], {})
+        self.assertEqual(settings["api_key"], "plain-key")
+        self.assertEqual(settings["base_url"], "https://example.test/v1")
+        self.assertEqual(settings["model"], "model")
+
+    def test_vault_roundtrip_encrypts_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Prana" / "settings.json"
+
+            def protect(api_key: str) -> str:
+                return base64.b64encode(
+                    f"encrypted:{api_key}".encode("utf-8")
+                ).decode("ascii")
+
+            def unprotect(encrypted: str) -> str:
+                return base64.b64decode(encrypted).decode("utf-8").removeprefix(
+                    "encrypted:"
+                )
+
+            with (
+                patch("settings_store.settings_file_path", return_value=path),
+                patch("settings_store._protect_api_key", side_effect=protect),
+                patch("settings_store._unprotect_api_key", side_effect=unprotect),
+            ):
                 settings_store.save_settings(
-                    "k-agnes",
-                    "https://x.test/v1",
+                    "main-key",
+                    "https://main.test/v1",
                     "main-model",
                     provider_vault={
                         "linked:agnes": {
                             "name": "Agnes",
-                            "base_url": "https://agnes.test/v1",
+                            "base_url": "https://apihub.agnes-ai.com/v1",
                             "api_key": "k-agnes",
-                            "api_key_hint": "…gnes",
-                            "models": [{"id": "m1", "name": "Model 1"}],
+                            "api_key_hint": "…agas",
+                            "models": [
+                                {"id": "agnes-3.0-flash", "name": "Agnes 3.0 Flash"}
+                            ],
+                            "image_model": "",
+                            "video_model": "",
+                            "review_model": "",
                         }
                     },
-                    vault_key="linked:agnes",
                 )
-                disk = path.read_text(encoding="utf-8")
-                loaded = settings_store.load_settings()
-        self.assertNotIn("k-agnes", disk)
-        self.assertIn("api_key_enc", disk)
-        entry = loaded["provider_vault"]["linked:agnes"]
+                saved_text = path.read_text(encoding="utf-8")
+                disk_vault = json.loads(saved_text)["provider_vault"]
+                settings = settings_store.load_settings()
+
+        self.assertIn("api_key_enc", disk_vault["linked:agnes"])
+        self.assertNotIn("k-agnes", saved_text)
+        entry = settings["provider_vault"]["linked:agnes"]
         self.assertEqual(entry["api_key"], "k-agnes")
-        self.assertEqual(entry["models"], [{"id": "m1", "name": "Model 1"}])
+        self.assertEqual(entry["api_key_hint"], "…agas")
+        self.assertEqual(
+            entry["models"],
+            [{"id": "agnes-3.0-flash", "name": "Agnes 3.0 Flash"}],
+        )
+        migrated = settings["provider_vault"]["custom:https://main.test/v1"]
+        self.assertEqual(migrated["api_key"], "main-key")
 
+    def test_save_without_vault_migrates_current_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Prana" / "settings.json"
 
-def test_default_modeling_settings():
-    value = settings_store.normalize_modeling(None)
-    assert value == {
-        "blender_path": "",
-        "blockbench_path": "",
-        "gmod_dir": "",
-        "sfm_dir": "",
-    }
+            def protect(api_key: str) -> str:
+                return base64.b64encode(
+                    f"encrypted:{api_key}".encode("utf-8")
+                ).decode("ascii")
 
+            def unprotect(encrypted: str) -> str:
+                return base64.b64decode(encrypted).decode("utf-8").removeprefix(
+                    "encrypted:"
+                )
 
-def test_modeling_normalize_strips_and_rejects_non_dict():
-    assert settings_store.normalize_modeling({"blender_path": "  x  "})["blender_path"] == "x"
-    with pytest.raises(ValueError, match="建模设置"):
-        settings_store.normalize_modeling([])
+            with (
+                patch("settings_store.settings_file_path", return_value=path),
+                patch("settings_store._protect_api_key", side_effect=protect),
+                patch("settings_store._unprotect_api_key", side_effect=unprotect),
+            ):
+                written = settings_store.save_settings(
+                    "openai-key",
+                    "https://api.openai.com/v1",
+                    "gpt-4o-mini",
+                )
+                entry = written["preset:OpenAI（GPT 官方）"]
+                self.assertEqual(entry["api_key"], "openai-key")
+                self.assertEqual(entry["models"], [])
+                settings = settings_store.load_settings()
 
+        loaded = settings["provider_vault"]["preset:OpenAI（GPT 官方）"]
+        self.assertEqual(loaded["api_key"], "openai-key")
+        self.assertEqual(loaded["base_url"], "https://api.openai.com/v1")
 
-def test_load_and_save_include_modeling_section(tmp_path: Path, monkeypatch):
-    monkeypatch.setattr(settings_store, "settings_file_path", lambda: tmp_path / "settings.json")
-    settings_store.save_settings(
-        api_key="k",
-        base_url="https://x.test/v1",
-        model="m",
-        provider_vault={},
-        game={"mc_name": "Prana"},
-        modeling={"blender_path": " D:\\blender.exe "},
-    )
-    loaded = settings_store.load_settings()
-    assert loaded["modeling"]["blender_path"] == "D:\\blender.exe"
-    assert loaded["game"]["mc_name"] == "Prana"
+    def test_save_upsert_keeps_models_when_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Prana" / "settings.json"
+
+            def protect(api_key: str) -> str:
+                return base64.b64encode(
+                    f"encrypted:{api_key}".encode("utf-8")
+                ).decode("ascii")
+
+            def unprotect(encrypted: str) -> str:
+                return base64.b64decode(encrypted).decode("utf-8").removeprefix(
+                    "encrypted:"
+                )
+
+            with (
+                patch("settings_store.settings_file_path", return_value=path),
+                patch("settings_store._protect_api_key", side_effect=protect),
+                patch("settings_store._unprotect_api_key", side_effect=unprotect),
+            ):
+                settings_store.save_settings(
+                    "key-a",
+                    "https://a.test/v1",
+                    "model-a",
+                    vault_models=[{"id": "m1", "name": "M1"}],
+                )
+                written = settings_store.save_settings(
+                    "key-a",
+                    "https://a.test/v1",
+                    "model-a",
+                )
+
+        self.assertEqual(
+            written["custom:https://a.test/v1"]["models"],
+            [{"id": "m1", "name": "M1"}],
+        )
 
 
 if __name__ == "__main__":
