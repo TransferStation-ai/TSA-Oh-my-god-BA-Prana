@@ -3561,5 +3561,47 @@ class ToollessNudgeTests(unittest.TestCase):
         self.assertEqual(reply, "收到。现在查询时间。")
 
 
+class GameModelingWiringTests(unittest.TestCase):
+    def test_complete_accepts_session_kwargs(self) -> None:
+        import inspect
+
+        params = inspect.signature(
+            AIClient.complete_with_media_skills
+        ).parameters
+        self.assertIn("game_session", params)
+        self.assertIn("modeling_session", params)
+
+    def test_review_methods_exist(self) -> None:
+        for name in (
+            "_review_game_join",
+            "review_game_skill",
+            "complete_game_turn",
+            "_review_modeling_operation",
+        ):
+            self.assertTrue(hasattr(AIClient, name), name)
+
+    def test_module_constants_exist(self) -> None:
+        import ai_client
+
+        for name in (
+            "GAME_JOIN_OPERATION_DESCRIPTION",
+            "GAME_REVIEW_SYSTEM_PROMPT",
+            "GAME_SKILL_REVIEW_SYSTEM_PROMPT",
+            "MODELING_REVIEW_SYSTEM_PROMPT",
+        ):
+            self.assertTrue(hasattr(ai_client, name), name)
+
+    def test_init_sets_game_and_modeling_settings(self) -> None:
+        client = AIClient({})
+        self.assertIsInstance(client.game_settings, dict)
+        self.assertIsInstance(client.modeling_settings, dict)
+
+    def test_modeling_module_functions_exist(self) -> None:
+        import ai_client
+
+        self.assertEqual(ai_client.modeling_tool_list(None), [])
+        self.assertTrue(hasattr(ai_client, "build_modeling_preview_message"))
+
+
 if __name__ == "__main__":
     unittest.main()
