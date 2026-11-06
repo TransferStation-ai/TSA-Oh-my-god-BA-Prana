@@ -10,6 +10,7 @@ from skills.game.wiki import (
 )
 
 MC_GAME = "mc"
+GM_GAME = "gm"
 PLAYER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 MC_ITEM_PATTERN = re.compile(r"^(?:[a-z0-9_.-]+:)?[a-z0-9_]+$")
 MAX_GAME_MESSAGE_LENGTH = 250
@@ -31,6 +32,8 @@ GAME_COMMAND_ACTIONS = (
     "place",
     "attack",
 )
+GM_COMMAND_ACTIONS = ("follow", "say", "stop", "status", "scan")
+GM_PLAYER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fff]{1,32}$")
 
 GAME_SKILLS: list[dict[str, object]] = [
     {
@@ -44,7 +47,7 @@ GAME_SKILLS: list[dict[str, object]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "game": {"type": "string", "enum": ["mc"]},
+                    "game": {"type": "string", "enum": ["mc", "gm"]},
                     "port": {
                         "type": "integer",
                         "minimum": 1,
@@ -65,7 +68,7 @@ GAME_SKILLS: list[dict[str, object]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "game": {"type": "string", "enum": ["mc"]},
+                    "game": {"type": "string", "enum": ["mc", "gm"]},
                     "host": {"type": "string"},
                     "port": {"type": "integer"},
                     "player_name": {"type": "string"},
@@ -90,7 +93,7 @@ GAME_SKILLS: list[dict[str, object]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "game": {"type": "string", "enum": ["mc"]},
+                    "game": {"type": "string", "enum": ["mc", "gm"]},
                     "action": {
                         "type": "string",
                         "enum": list(GAME_COMMAND_ACTIONS),
@@ -118,7 +121,7 @@ GAME_SKILLS: list[dict[str, object]] = [
             "description": "结束当前游戏会话。",
             "parameters": {
                 "type": "object",
-                "properties": {"game": {"type": "string", "enum": ["mc"]}},
+                "properties": {"game": {"type": "string", "enum": ["mc", "gm"]}},
                 "required": ["game"],
                 "additionalProperties": False,
             },
@@ -163,6 +166,76 @@ class GameSessionAccess(Protocol):
     def status(self, game: str) -> dict[str, object]: ...
 
 
+def _validate_gm_arguments(name: str, arguments: dict[str, object]) -> None:
+    if name == "probe_game_server":
+        if "port" in arguments:
+            port = arguments["port"]
+            if (
+                isinstance(port, bool)
+                or not isinstance(port, int)
+                or not 1 <= port <= 65535
+            ):
+                raise ValueError("端口必须在 1-65535 之间。")
+        return
+    if name == "join_game":
+        host = arguments.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError("服务器地址不能为空。")
+        port = arguments.get("port")
+        if (
+            isinstance(port, bool)
+            or not isinstance(port, int)
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError("端口必须在 1-65535 之间。")
+        player_name = arguments.get("player_name", "")
+        if not isinstance(player_name, str) or (
+            player_name and GM_PLAYER_NAME_PATTERN.fullmatch(player_name) is None
+        ):
+            raise ValueError(
+                "GMod 玩家名只能使用字母、数字、下划线或中文（1-32 位）。"
+            )
+        # GMod 忽略 version，不校验
+        return
+    if name == "game_command":
+        action = arguments.get("action")
+        if action not in GM_COMMAND_ACTIONS:
+            raise ValueError("未知的游戏动作。")
+        action_fields = {
+            "follow": {"target"},
+            "say": {"text"},
+            "stop": set(),
+            "status": set(),
+            "scan": {"max_distance"},
+        }
+        supplied_fields = set(arguments) - {"game", "action"}
+        if supplied_fields - action_fields[action]:
+            raise ValueError("游戏动作包含不适用的参数。")
+        if action == "say":
+            text = arguments.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError("游戏内消息不能为空。")
+            if len(text) > MAX_GAME_MESSAGE_LENGTH:
+                raise ValueError("游戏内消息不能超过 250 个字符。")
+        if action == "follow":
+            target = arguments.get("target")
+            if target is not None and (
+                not isinstance(target, str) or not target.strip()
+            ):
+                raise ValueError("follow 需要指定玩家名。")
+        if action == "scan":
+            distance = arguments.get("max_distance", 24)
+            if (
+                isinstance(distance, bool)
+                or not isinstance(distance, int)
+                or not 1 <= distance <= 64
+            ):
+                raise ValueError("扫描距离必须是 1 到 64 格之间的整数。")
+        return
+    # leave_game 只带 game，无需额外校验
+    return
+
+
 def validate_game_skill_arguments(name: str, arguments: object) -> None:
     if not isinstance(arguments, dict):
         raise ValueError("游戏 skill 参数必须是对象。")
@@ -191,8 +264,14 @@ def validate_game_skill_arguments(name: str, arguments: object) -> None:
         raise ValueError("游戏 skill 包含未知参数。")
     if "game" not in arguments:
         raise ValueError("游戏类型不能为空。")
-    if arguments["game"] != MC_GAME:
-        raise ValueError('一期只支持 Minecraft（game 必须为 "mc"）。')
+    game = arguments["game"]
+    if game not in (MC_GAME, GM_GAME):
+        raise ValueError(
+            '一期支持 Minecraft（game 必须为 "mc"）或 GMod（game 必须为 "gm"）。'
+        )
+    if game == GM_GAME:
+        _validate_gm_arguments(name, arguments)
+        return
 
     if name == "probe_game_server":
         if "port" in arguments:
@@ -354,6 +433,8 @@ def invoke_game_skill(
 __all__ = [
     "GAME_SKILLS",
     "GameSessionAccess",
+    "GM_COMMAND_ACTIONS",
+    "GM_GAME",
     "MINECRAFT_WIKI_SKILLS",
     "invoke_minecraft_wiki_skill",
     "invoke_game_skill",
