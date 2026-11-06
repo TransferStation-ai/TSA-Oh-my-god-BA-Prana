@@ -22,13 +22,25 @@ from brainstorm import BrainstormEvent, BrainstormRunner
 from chat_session import split_message_segments, trim_history
 from help_content import HELP_SECTIONS, QUICK_START_PROMPTS
 import opencode_import
-from providers import BUILTIN_PROVIDERS, ProviderPreset, normalize_base_url
+import settings_store
+from providers import (
+    BUILTIN_PROVIDERS,
+    ProviderPreset,
+    custom_vault_key,
+    linked_vault_key,
+    make_key_hint,
+    normalize_base_url,
+    preset_vault_key,
+    resolve_main_vault_key,
+)
 from sessions import (
     KIND_MAIN,
     SessionStore,
     build_session_title,
     new_message,
 )
+from skills.game.session import GameSession
+from skills.modeling.session import ModelingSession
 from skills.desktop import start_escape_watchdog
 import streaming
 
@@ -112,6 +124,9 @@ SYSTEM_PROMPT = (
      "不要调用 read_git_repository。每次 run_shell_command 必须填 "
      "description；不要执行危险命令（删除、格式化、git push、iex 等）"
      "除非老师明确要求并确认。"
+     "陪老师玩 Minecraft 时：先用 probe_game_server 探测本地服务器；找到就用 join_game 连上，"
+     "没找到就向老师询问服务器 IP 和端口，不要自己猜地址。普拉娜在游戏里是一个真实玩家，"
+     "加入后可以在游戏里跟随、说话、回私聊；老师没有要求时不要主动加入。"
 )
 
 BACKGROUND = "#171821"
@@ -128,6 +143,37 @@ THINKING_LINE = "#3a3a4a"
 THINKING_ICON_ACTIVE = "✳"
 THINKING_ICON_COLLAPSED = "▸"
 THINKING_ICON_EXPANDED = "▾"
+
+
+def game_event_text(kind: str, payload: dict[str, object]) -> str:
+    if kind in {"chat", "whisper"}:
+        username = str(payload.get("username") or "玩家")
+        message = str(payload.get("message") or "")
+        return f"【游戏】{username}：{message}"
+    if kind == "joined":
+        host = str(payload.get("host") or "")
+        port = str(payload.get("port") or "")
+        version = str(payload.get("version") or "未知")
+        return f"【游戏】普拉娜已加入 {host}:{port}（Minecraft {version}）"
+    if kind == "left":
+        return "【游戏】普拉娜已离开 Minecraft"
+    if kind == "error":
+        return f"【游戏】{payload.get('message', '发生未知错误')}"
+    return f"【游戏】{kind}"
+
+
+def game_event_message(
+    kind: str, payload: dict[str, object]
+) -> dict[str, object]:
+    text = game_event_text(kind, payload)
+    return new_message(
+        "assistant",
+        text,
+        display=text,
+        kind="game",
+        in_api=False,
+        muted=True,
+    )
 
 
 class ThinkingBlock:
@@ -350,6 +396,126 @@ class _DesktopAccessAdapter:
         )
 
 
+@dataclass
+class _GameSessionState:
+    session: GameSession | None = None
+
+
+@dataclass
+class _ModelingSessionState:
+    session: ModelingSession | None = None
+
+
+class _GameSessionAccessAdapter:
+    def __init__(self, app: "PranaApp", request: ChatRequest) -> None:
+        self.app = app
+        self.session_id = request.session_id
+
+    def _session(self) -> GameSession:
+        return self.app._game_session(self.session_id)
+
+    def probe(self, game: str) -> dict[str, object]:
+        return self._session().probe(game)
+
+    def join(
+        self,
+        game: str,
+        host: str,
+        port: int,
+        player_name: str = "",
+        version: str | None = None,
+    ) -> dict[str, object]:
+        return self._session().join(
+            game, host, port, player_name, version
+        )
+
+    def command(
+        self,
+        game: str,
+        action: str,
+        *,
+        target: str = "",
+        text: str = "",
+    ) -> dict[str, object]:
+        return self._session().command(
+            game, action, target=target, text=text
+        )
+
+    def leave(self, game: str) -> dict[str, object]:
+        return self._session().leave(game)
+
+    def status(self, game: str) -> dict[str, object]:
+        return self._session().status(game)
+
+
+class _ModelingSessionAccessAdapter:
+    def __init__(self, app: "PranaApp", request: ChatRequest) -> None:
+        self.app = app
+        self.session_id = request.session_id
+
+    def _session(self) -> ModelingSession:
+        return self.app._modeling_session(self.session_id)
+
+    def start(
+        self,
+        source_models_dir: str,
+        output_name: str,
+        brief: str = "",
+    ) -> dict[str, object]:
+        return self._session().start(
+            source_models_dir=source_models_dir,
+            output_name=output_name,
+            brief=brief,
+        )
+
+    def open_reference(self, app: str = "blockbench") -> dict[str, object]:
+        return self._session().open_reference(app=app)
+
+    def run_python(
+        self,
+        code: str,
+        description: str,
+        timeout_seconds: float = 120.0,
+    ) -> dict[str, object]:
+        return self._session().run_python(
+            code=code,
+            description=description,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def render_preview(
+        self,
+        view: str,
+        resolution: str = "900x1200",
+        caption: str = "",
+    ) -> dict[str, object]:
+        return self._session().render_preview(
+            view=view,
+            resolution=resolution,
+            caption=caption,
+        )
+
+    def compile(
+        self,
+        output_name: str,
+        surfaceprop: str = "flesh",
+        make_lods: bool = True,
+        make_hands: bool = True,
+    ) -> dict[str, object]:
+        return self._session().compile(
+            output_name=output_name,
+            surfaceprop=surfaceprop,
+            make_lods=make_lods,
+            make_hands=make_hands,
+        )
+
+    def status(self) -> dict[str, object]:
+        return self._session().status()
+
+    def stop(self) -> dict[str, object]:
+        return self._session().stop()
+
+
 class PranaApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -378,6 +544,8 @@ class PranaApp:
         self.next_request_id = 1
         self.closing = False
         self.desktop_sessions: dict[str, _DesktopSessionState] = {}
+        self.game_sessions: dict[str, _GameSessionState] = {}
+        self.modeling_sessions: dict[str, _ModelingSessionState] = {}
 
         self._build_header()
         self._build_provider_sidebar()
@@ -453,6 +621,22 @@ class PranaApp:
             bg="#4b3f6f",
             fg=TEXT,
             activebackground="#5d4f86",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=13,
+            pady=8,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+        )
+
+        self.game_indicator = tk.Button(
+            header,
+            text="游戏中 · 普拉娜在 Minecraft · 结束",
+            command=self._revoke_active_game,
+            bg="#2f4b3f",
+            fg=TEXT,
+            activebackground="#3b604d",
             activeforeground=TEXT,
             relief=tk.FLAT,
             borderwidth=0,
@@ -641,6 +825,7 @@ class PranaApp:
                     "无法删除会话", str(error), parent=dialog
                 )
                 return
+            self._close_game_session(str(summary["id"]))
             if summary.get("id") == self.active_session_id:
                 remaining = self.session_store.list_sessions(
                     kind=KIND_MAIN
@@ -847,45 +1032,168 @@ class PranaApp:
         content = tk.Frame(dialog, bg=BACKGROUND, padx=24, pady=20)
         content.pack(fill=tk.BOTH, expand=True)
 
-        switching_provider = provider is not None and not provider.matches(
-            str(self.ai_client.base_url)
+        vault_entries = {
+            key: dict(entry)
+            for key, entry in self.ai_client.provider_vault.items()
+        }
+        for linked in linked_providers:
+            linked_key = linked_vault_key(str(linked.get("id", "")))
+            if linked.get("api_key") and linked.get("base_url"):
+                vault_entries.setdefault(
+                    linked_key,
+                    {
+                        "name": linked.get("name", linked.get("id", "")),
+                        "base_url": linked.get("base_url", ""),
+                        "api_key": linked.get("api_key", ""),
+                        "api_key_hint": make_key_hint(
+                            str(linked.get("api_key", ""))
+                        ),
+                        "models": linked.get("models", []),
+                        "image_model": "",
+                        "video_model": "",
+                        "review_model": "",
+                    },
+                )
+        current_key = self.ai_client.vault_key
+        if current_key not in vault_entries and self.ai_client.api_key:
+            vault_entries[current_key] = {
+                "name": next(
+                    (
+                        item.name
+                        for item in BUILTIN_PROVIDERS
+                        if item.matches(str(self.ai_client.base_url))
+                    ),
+                    f"自定义 {self.ai_client.base_url}",
+                ),
+                "base_url": self.ai_client.base_url,
+                "api_key": self.ai_client.api_key,
+                "api_key_hint": make_key_hint(self.ai_client.api_key),
+                "models": self.ai_client.model_catalog,
+                "image_model": self.ai_client.image_model,
+                "video_model": self.ai_client.video_model,
+                "review_model": self.ai_client.review_model,
+            }
+
+        provider_options: list[tuple[str, str]] = [
+            (item.name, preset_vault_key(item.name))
+            for item in BUILTIN_PROVIDERS
+        ]
+        for key, entry in vault_entries.items():
+            if key.startswith(("linked:", "custom:")) and entry.get("api_key"):
+                provider_options.append((str(entry.get("name") or key), key))
+        provider_options.append(("自定义地址…", "custom-entry"))
+        provider_keys = {label: key for label, key in provider_options}
+        initial_key = (
+            preset_vault_key(provider.name)
+            if provider is not None
+            else current_key
         )
+        if initial_key not in provider_keys.values():
+            initial_key = "custom-entry"
+        initial_label = next(
+            label for label, key in provider_options if key == initial_key
+        )
+        provider_var = tk.StringVar(value=initial_label)
+        tk.Label(
+            content,
+            text="提供商",
+            bg=BACKGROUND,
+            fg=TEXT,
+            font=("Segoe UI", 9),
+        ).pack(anchor=tk.W, pady=(0, 4))
+        provider_menu = tk.OptionMenu(
+            content,
+            provider_var,
+            *(label for label, _key in provider_options),
+            command=lambda label: update_provider_fields(label),
+        )
+        provider_menu.configure(
+            bg="#292a36",
+            fg=TEXT,
+            activebackground="#373847",
+            activeforeground=TEXT,
+            relief=tk.FLAT,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+        )
+        provider_menu.pack(fill=tk.X, pady=(0, 8))
+
+        def selected_key() -> str:
+            return provider_keys.get(provider_var.get(), "custom-entry")
+
+        def selected_entry(key: str | None = None) -> dict[str, object]:
+            return vault_entries.get(key or selected_key(), {})
+
         fields: list[tuple[str, tk.Entry]] = []
+        initial_entry = selected_entry(initial_key)
+        initial_provider = next(
+            (
+                item
+                for item in BUILTIN_PROVIDERS
+                if preset_vault_key(item.name) == initial_key
+            ),
+            None,
+        )
+        initial_models = initial_entry.get("models", [])
+        if not isinstance(initial_models, list):
+            initial_models = []
+        initial_model = (
+            self.ai_client.model
+            if initial_key == current_key
+            else str(initial_entry.get("model", ""))
+            or (
+                str(initial_models[0].get("id", ""))
+                if initial_models and isinstance(initial_models[0], dict)
+                else ""
+            )
+        )
         for label, value, secret in (
             (
-                "API Key（同一地址留空保留；切换地址必填）"
-                if self.ai_client.api_key
-                else "API Key（首次配置必填）",
-                "",
+                "API Key（留空或保持提示值可保留；新提供商首次配置时填写）",
+                str(initial_entry.get("api_key_hint", "")),
                 True,
             ),
             (
                 "API 基础地址（OpenAI 官方用 Responses，其他用 Chat Completions）",
-                provider.base_url if provider else self.ai_client.base_url,
+                str(initial_entry.get("base_url") or (
+                    initial_provider.base_url
+                    if initial_provider
+                    else self.ai_client.base_url
+                )),
                 False,
             ),
             (
                 "对话模型（必填）",
-                "" if switching_provider else self.ai_client.model,
+                initial_model,
                 False,
             ),
             (
                 "图片生成模型（生成图片时使用）",
-                provider.image_model
-                if switching_provider and provider
-                else self.ai_client.image_model,
+                str(
+                    initial_entry.get("image_model")
+                    or (
+                        initial_provider.image_model
+                        if initial_provider and initial_key != current_key
+                        else ""
+                    )
+                ),
                 False,
             ),
             (
                 "视频生成模型（生成视频时使用）",
-                provider.video_model
-                if switching_provider and provider
-                else self.ai_client.video_model,
+                str(
+                    initial_entry.get("video_model")
+                    or (
+                        initial_provider.video_model
+                        if initial_provider and initial_key != current_key
+                        else ""
+                    )
+                ),
                 False,
             ),
             (
                 "操作审查模型（媒体、终端、工作区、桌面控制必填）",
-                "" if switching_provider else self.ai_client.review_model,
+                str(initial_entry.get("review_model", "")),
                 False,
             ),
             (
@@ -912,6 +1220,8 @@ class PranaApp:
                 font=("Segoe UI", 10),
             )
             entry.pack(fill=tk.X, ipady=8)
+            if label.startswith("API Key"):
+                value = ""
             if value:
                 entry.insert(0, value)
             fields.append((label, entry))
@@ -923,6 +1233,260 @@ class PranaApp:
         video_model_entry = fields[4][1]
         review_model_entry = fields[5][1]
         brainstorm_rounds_entry = fields[6][1]
+        api_key_hint = tk.StringVar()
+        model_catalog_status = tk.StringVar(value="")
+        tk.Label(
+            content,
+            textvariable=api_key_hint,
+            bg=BACKGROUND,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, pady=(3, 0))
+        model_list = tk.Listbox(
+            content,
+            bg="#292a36",
+            fg=TEXT,
+            selectbackground="#57516f",
+            relief=tk.FLAT,
+            borderwidth=0,
+            height=4,
+            font=("Segoe UI", 9),
+        )
+        tk.Label(
+            content,
+            text="模型目录（可编辑输入框仍支持手动填写）",
+            bg=BACKGROUND,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, pady=(8, 3))
+        model_list.pack(fill=tk.X)
+        tk.Label(
+            content,
+            textvariable=model_catalog_status,
+            bg=BACKGROUND,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+        ).pack(anchor=tk.W, pady=(3, 0))
+        refresh_models_button = tk.Button(
+            content,
+            text="刷新模型列表",
+            bg=SURFACE_HOVER,
+            fg=TEXT,
+            relief=tk.FLAT,
+            padx=10,
+            pady=5,
+            font=("Segoe UI", 8),
+        )
+        refresh_models_button.pack(anchor=tk.W, pady=(5, 0))
+        game_entries: dict[str, tk.Entry] = {}
+        for label, key in (
+            ("MC 玩家名", "mc_name"),
+            ("MC 皮肤路径", "mc_skin_path"),
+            ("皮肤命令（可选，服务端需支持皮肤插件）", "mc_skin_command"),
+        ):
+            tk.Label(
+                content,
+                text=label,
+                bg=BACKGROUND,
+                fg=TEXT,
+                font=("Segoe UI", 9),
+            ).pack(anchor=tk.W, pady=(7, 3))
+            entry = tk.Entry(
+                content,
+                bg="#292a36",
+                fg=TEXT,
+                insertbackground=TEXT,
+                relief=tk.FLAT,
+                borderwidth=0,
+                font=("Segoe UI", 10),
+            )
+            entry.pack(fill=tk.X, ipady=7)
+            entry.insert(0, str(self.ai_client.game_settings.get(key, "")))
+            game_entries[key] = entry
+
+        def display_catalog(entry: dict[str, object]) -> None:
+            model_list.delete(0, tk.END)
+            models = entry.get("models", [])
+            if not isinstance(models, list):
+                return
+            for item in models:
+                if isinstance(item, dict):
+                    model_id = item.get("id")
+                    name = item.get("name", model_id)
+                    if isinstance(model_id, str):
+                        model_list.insert(tk.END, f"{name}  ({model_id})")
+
+        def select_model_from_catalog(_event: object = None) -> None:
+            selection = model_list.curselection()
+            if not selection:
+                return
+            models = selected_entry().get("models", [])
+            index = int(selection[0])
+            if isinstance(models, list) and index < len(models):
+                selected_model = models[index]
+                if isinstance(selected_model, dict):
+                    model_entry.delete(0, tk.END)
+                    model_entry.insert(0, str(selected_model.get("id", "")))
+
+        model_list.bind("<<ListboxSelect>>", select_model_from_catalog)
+
+        def update_provider_fields(label: str) -> None:
+            key = provider_keys.get(label, "custom-entry")
+            entry = selected_entry(key)
+            preset = next(
+                (
+                    item
+                    for item in BUILTIN_PROVIDERS
+                    if preset_vault_key(item.name) == key
+                ),
+                None,
+            )
+            api_key_entry.delete(0, tk.END)
+            api_key_hint.set(
+                f"已保存 API Key：{entry.get('api_key_hint') or '未配置'}"
+            )
+            base_url_entry.configure(
+                state=tk.NORMAL if key == "custom-entry" else tk.DISABLED
+            )
+            base_url_entry.configure(state=tk.NORMAL)
+            base_url_entry.delete(0, tk.END)
+            base_url_entry.insert(
+                0,
+                str(
+                    entry.get("base_url")
+                    or (preset.base_url if preset else "")
+                ),
+            )
+            models = entry.get("models", [])
+            if not isinstance(models, list):
+                models = []
+            model_entry.delete(0, tk.END)
+            if key == current_key:
+                model_entry.insert(0, self.ai_client.model)
+            elif entry.get("model"):
+                model_entry.insert(0, str(entry["model"]))
+            elif models and isinstance(models[0], dict):
+                model_entry.insert(0, str(models[0].get("id", "")))
+            for field_entry, field_name, default in (
+                (image_model_entry, "image_model", preset.image_model if preset else ""),
+                (video_model_entry, "video_model", preset.video_model if preset else ""),
+                (review_model_entry, "review_model", ""),
+            ):
+                field_entry.delete(0, tk.END)
+                field_entry.insert(0, str(entry.get(field_name) or default))
+            display_catalog(entry)
+            model_catalog_status.set(
+                f"已保存 {len(models)} 个模型"
+                if models
+                else "暂无模型目录，可刷新或手动输入模型名。"
+            )
+            if key != "custom-entry":
+                base_url_entry.configure(state=tk.DISABLED)
+
+        api_key_hint.set(
+            f"已保存 API Key：{initial_entry.get('api_key_hint') or '未配置'}"
+        )
+        display_catalog(initial_entry)
+        model_catalog_status.set(
+            f"已保存 {len(initial_models)} 个模型"
+            if initial_models
+            else "暂无模型目录，可刷新或手动输入模型名。"
+        )
+        if initial_key != "custom-entry":
+            base_url_entry.configure(state=tk.DISABLED)
+
+        def refresh_models() -> None:
+            key = selected_key()
+            address = normalize_base_url(base_url_entry.get())
+            entry = selected_entry(key)
+            typed_key = api_key_entry.get().strip()
+            saved_key = str(entry.get("api_key", ""))
+            api_key = typed_key or saved_key
+            refresh_models_button.configure(state=tk.DISABLED)
+            model_catalog_status.set("正在获取模型目录…")
+            result: dict[str, object] = {}
+
+            def work() -> None:
+                try:
+                    result["models"] = self.ai_client.fetch_provider_models(
+                        address, api_key
+                    )
+                except (OSError, RuntimeError, ValueError) as error:
+                    result["error"] = error
+
+            thread = threading.Thread(target=work, daemon=True)
+            thread.start()
+
+            def poll() -> None:
+                if not dialog.winfo_exists():
+                    return
+                if thread.is_alive():
+                    dialog.after(100, poll)
+                    return
+                refresh_models_button.configure(state=tk.NORMAL)
+                error = result.get("error")
+                if isinstance(error, Exception):
+                    model_catalog_status.set(str(error))
+                    return
+                models = result.get("models")
+                if not isinstance(models, list):
+                    model_catalog_status.set("AI 服务没有返回可用模型。")
+                    return
+                target_key = (
+                    key
+                    if key != "custom-entry"
+                    else custom_vault_key(address)
+                )
+                updated_entry = {
+                    **entry,
+                    "name": entry.get("name")
+                    or (
+                        next(
+                            (
+                                item.name
+                                for item in BUILTIN_PROVIDERS
+                                if item.matches(address)
+                            ),
+                            f"自定义 {address}",
+                        )
+                    ),
+                    "base_url": address,
+                    "api_key": api_key,
+                    "api_key_hint": (
+                        "…" + api_key[-4:] if len(api_key) > 4 else "…"
+                    ),
+                    "models": models,
+                }
+                vault_entries[target_key] = updated_entry
+                self.ai_client.provider_vault = {
+                    entry_key: dict(value)
+                    for entry_key, value in vault_entries.items()
+                }
+                try:
+                    self.ai_client.save_configuration(
+                        str(self.ai_client.api_key),
+                        str(self.ai_client.base_url),
+                        str(self.ai_client.model),
+                        image_model=str(self.ai_client.image_model),
+                        video_model=str(self.ai_client.video_model),
+                        review_model=str(self.ai_client.review_model),
+                        models=self.ai_client.model_catalog,
+                        vault_key=self.ai_client.vault_key,
+                        game=self.ai_client.game_settings,
+                    )
+                except (OSError, RuntimeError, ValueError) as save_error:
+                    model_catalog_status.set(
+                        f"获取成功，但保存模型目录失败：{save_error}"
+                    )
+                    return
+                if target_key != key:
+                    provider_keys[provider_var.get()] = target_key
+                display_catalog(updated_entry)
+                model_catalog_status.set(f"已保存 {len(models)} 个模型")
+
+            dialog.after(100, poll)
+
+        refresh_models_button.configure(command=refresh_models)
 
         subagent_status = tk.StringVar(value=f"已配置 {len(subagents)} 个子代理")
         linked_status = tk.StringVar(
@@ -1047,6 +1611,7 @@ class PranaApp:
             self._center_window(manager, dialog)
 
         def open_import() -> None:
+            base_url_entry.configure(state=tk.NORMAL)
             self._open_opencode_import(
                 dialog,
                 api_key_entry,
@@ -1081,9 +1646,13 @@ class PranaApp:
             command=lambda: self._open_linked_providers(
                 dialog,
                 linked_providers,
-                lambda: linked_status.set(
-                    f"已链接 {len(linked_providers)} 个提供商"
+                lambda: (
+                    linked_status.set(
+                        f"已链接 {len(linked_providers)} 个提供商"
+                    ),
+                    display_catalog(selected_entry()),
                 ),
+                provider_vault=vault_entries,
             ),
             bg=SURFACE_HOVER,
             fg=TEXT,
@@ -1128,14 +1697,48 @@ class PranaApp:
 
         def save() -> None:
             try:
-                api_key = api_key_entry.get().strip()
-                same_address = normalize_base_url(base_url_entry.get()) == (
-                    normalize_base_url(str(self.ai_client.base_url))
+                typed_key = api_key_entry.get().strip()
+                address = normalize_base_url(base_url_entry.get())
+                selected_provider_key = selected_key()
+                selected_provider_entry = vault_entries.get(
+                    selected_provider_key, {}
                 )
+                selected_address = normalize_base_url(
+                    str(selected_provider_entry.get("base_url", ""))
+                )
+                if (
+                    selected_provider_key == "custom-entry"
+                    or (
+                        selected_address
+                        and selected_address != address
+                    )
+                ):
+                    target_key = next(
+                        (
+                            key
+                            for key, entry in vault_entries.items()
+                            if key.startswith("linked:")
+                            and normalize_base_url(
+                                str(entry.get("base_url", ""))
+                            )
+                            == address
+                        ),
+                        resolve_main_vault_key(address),
+                    )
+                else:
+                    target_key = selected_provider_key
+                target_entry = vault_entries.get(target_key, {})
+                if (
+                    not typed_key
+                    or typed_key == str(target_entry.get("api_key_hint", ""))
+                ):
+                    api_key = str(target_entry.get("api_key", "")).strip()
+                else:
+                    api_key = typed_key
                 if not api_key:
-                    if not same_address:
-                        raise ValueError("切换 API 地址后，请填写该提供商的 API Key。")
-                    api_key = self.ai_client.api_key
+                    raise ValueError(
+                        "该提供商还没有保存 Key，请填写 API Key。"
+                    )
                 rounds_text = brainstorm_rounds_entry.get().strip()
                 try:
                     brainstorm_rounds = int(rounds_text)
@@ -1147,9 +1750,22 @@ class PranaApp:
                     raise ValueError(
                         "头脑风暴轮数必须在 1-50 之间。"
                     )
+                self.ai_client.provider_vault = {
+                    key: dict(entry) for key, entry in vault_entries.items()
+                }
+                target_models = target_entry.get("models", [])
+                if not isinstance(target_models, list):
+                    target_models = []
+                game_settings = {
+                    **self.ai_client.game_settings,
+                    **{
+                        key: entry.get().strip()
+                        for key, entry in game_entries.items()
+                    },
+                }
                 self.ai_client.save_configuration(
                     api_key,
-                    base_url_entry.get(),
+                    address,
                     model_entry.get(),
                     subagents,
                     image_model_entry.get(),
@@ -1157,6 +1773,15 @@ class PranaApp:
                     review_model_entry.get(),
                     brainstorm_rounds=brainstorm_rounds,
                     linked_providers=linked_providers,
+                    models=[
+                        dict(item)
+                        for item in target_models
+                        if isinstance(item, dict)
+                        and isinstance(item.get("id"), str)
+                        and isinstance(item.get("name", item.get("id")), str)
+                    ],
+                    vault_key=target_key,
+                    game=game_settings,
                 )
             except (OSError, RuntimeError, ValueError) as error:
                 messagebox.showerror(
@@ -1476,6 +2101,8 @@ class PranaApp:
         parent: tk.Toplevel,
         linked_providers: list[dict[str, object]],
         on_changed: Callable[[], None],
+        *,
+        provider_vault: dict[str, dict[str, object]] | None = None,
     ) -> None:
         dialog = tk.Toplevel(parent)
         dialog.title("已链接提供商")
@@ -1847,6 +2474,37 @@ class PranaApp:
                     if isinstance(model, dict)
                     and isinstance(model.get("id"), str)
                 ]
+                if provider_vault is not None:
+                    vault_key = self.ai_client.vault_key
+                    current_entry = dict(
+                        provider_vault.get(vault_key, {})
+                    )
+                    current_entry["models"] = [
+                        {
+                            "id": model["id"],
+                            "name": model.get("name", model["id"]),
+                        }
+                        for model in linked["models"]
+                        if isinstance(model, dict)
+                        and isinstance(model.get("id"), str)
+                    ]
+                    current_entry.setdefault(
+                        "name",
+                        next(
+                            (
+                                preset.name
+                                for preset in BUILTIN_PROVIDERS
+                                if preset.matches(self.ai_client.base_url)
+                            ),
+                            f"自定义 {self.ai_client.base_url}",
+                        ),
+                    )
+                    current_entry["base_url"] = self.ai_client.base_url
+                    current_entry["api_key"] = self.ai_client.api_key
+                    current_entry["api_key_hint"] = make_key_hint(
+                        self.ai_client.api_key
+                    )
+                    provider_vault[vault_key] = current_entry
                 try:
                     index = linked_providers.index(linked)
                 except ValueError:
@@ -2272,6 +2930,7 @@ class PranaApp:
         self._render_active_session()
         self._update_pending_status()
         self._refresh_desktop_indicator()
+        self._refresh_game_indicator()
         self._refresh_workspace_indicator()
 
     def _reload_active_session(self) -> None:
@@ -3860,6 +4519,8 @@ class PranaApp:
                     message_sender=send_chat_message,
                     brainstorm_runner=brainstorm_runner,
                     desktop_access=desktop_access,
+                    game_session=_GameSessionAccessAdapter(self, request),
+                    modeling_session=_ModelingSessionAccessAdapter(self, request),
                     permanent_root=workspace_root_holder[0],
                     permanent_root_provider=workspace_root_provider,
                     on_workspace_switched=on_workspace_switched,
@@ -4645,6 +5306,7 @@ class PranaApp:
                 is_error=True,
             )
             return
+        self._close_game_session(self.active_session_id)
         self._clear_attachments()
         self._render_active_session()
         self._update_pending_status()
@@ -4881,6 +5543,72 @@ class PranaApp:
         else:
             self.desktop_indicator.pack_forget()
 
+    def _game_session(self, session_id: str) -> GameSession:
+        with self.state_lock:
+            state = self.game_sessions.setdefault(
+                session_id, _GameSessionState()
+            )
+            if state.session is None:
+                state.session = GameSession(
+                    game_settings=self.ai_client.game_settings,
+                    data_dir=settings_store.settings_file_path().parent,
+                    complete=self.ai_client.complete_game_turn,
+                    on_event=lambda kind, payload: self._post_to_ui(
+                        lambda: self._append_game_event(
+                            session_id, kind, payload
+                        )
+                    ),
+                )
+            return state.session
+
+    def _append_game_event(
+        self,
+        session_id: str,
+        kind: str,
+        payload: dict[str, object],
+    ) -> None:
+        text = game_event_text(kind, payload)
+        message = game_event_message(kind, payload)
+        self._append_session_message(session_id, message)
+        if session_id == self.active_session_id:
+            self._add_message("assistant", text, is_muted=True)
+        self._refresh_game_indicator()
+
+    def _refresh_game_indicator(self) -> None:
+        session_id = self.active_session_id
+        with self.state_lock:
+            state = self.game_sessions.get(session_id or "")
+            active = (
+                state is not None
+                and state.session is not None
+                and state.session.active_game is not None
+            )
+        if active:
+            self.game_indicator.pack(side=tk.RIGHT, padx=(0, 8))
+        else:
+            self.game_indicator.pack_forget()
+
+    def _revoke_active_game(self) -> None:
+        session_id = self.active_session_id
+        if session_id is None:
+            return
+        with self.state_lock:
+            state = self.game_sessions.get(session_id)
+        if state is not None and state.session is not None:
+            try:
+                state.session.close()
+            except (OSError, RuntimeError) as error:
+                self._append_game_event(
+                    session_id, "error", {"message": str(error)}
+                )
+        self._refresh_game_indicator()
+
+    def _close_game_session(self, session_id: str) -> None:
+        with self.state_lock:
+            state = self.game_sessions.pop(session_id, None)
+        if state is not None and state.session is not None:
+            state.session.close()
+
     def _on_close(self) -> None:
         self.closing = True
         with self.state_lock:
@@ -4891,11 +5619,19 @@ class PranaApp:
             self.pending_requests.clear()
             states = list(self.desktop_sessions.values())
             self.desktop_sessions.clear()
+            game_states = list(self.game_sessions.values())
+            self.game_sessions.clear()
         for state in states:
             state.authorized = False
             state.stop_event.set()
             if state.watchdog_stop is not None:
                 state.watchdog_stop()
+        for state in game_states:
+            if state.session is not None:
+                try:
+                    state.session.close()
+                except (OSError, RuntimeError):
+                    pass
         self.request_queue.put(None)
         self.root.destroy()
 

@@ -30,7 +30,7 @@ SESSION_STATUSES = {
     STATUS_INTERRUPTED,
     STATUS_FAILED,
 }
-MESSAGE_KINDS = {"text", "brainstorm", "brainstorm_summary"}
+MESSAGE_KINDS = {"text", "brainstorm", "brainstorm_summary", "game"}
 AUTO_TITLE_LENGTH = 30
 MAX_TITLE_LENGTH = 60
 

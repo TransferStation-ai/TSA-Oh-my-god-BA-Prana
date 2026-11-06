@@ -8,7 +8,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -m PyInstaller --noconfirm --clean --onefile --windowed --name Prana main.py
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name Prana --add-data "prana_mc_body;prana_mc_body" main.py
 if errorlevel 1 exit /b 1
 
 echo Built: dist\Prana.exe
