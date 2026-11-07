@@ -176,6 +176,29 @@ HELP_SECTIONS: tuple[tuple[str, str], ...] = (
         "讨论记录随主会话保存在本机；缺少地址或 Key 的提供商会被跳过。",
     ),
     (
+        "3D 建模 / GMod 玩家模型",
+        "能做什么\n"
+        "明确要求制作或修改 Garry's Mod 玩家模型时，AI 会启动一次建模作业："
+        "读取老师指定的 YSM 参考模型，在 Blender 中分步建模，渲染多角度预览，"
+        "最后编译成可放进 garrysmod/addons 的玩家模型与第一人称手模。\n\n"
+        "前置工具\n"
+        "Blender 3.0 可执行文件路径为必填项；Blockbench、Garry's Mod 根目录"
+        "和 SFM 根目录可选。GMod 根目录用于查找 studiomdl，SFM 目录作为 Source "
+        "工具的回退。工具路径在“设置 → 建模工具路径”中填写并保存。\n\n"
+        "审查与隐私\n"
+        "启动作业、打开参考、执行 Blender Python、渲染预览、编译和停止，"
+        "每一步都必须经操作审查模型批准；审查拒绝时不会重试。预览图、模型内容、"
+        "脚本输出和日志都按不可信数据处理，每条请求最多展示 8 张预览。\n\n"
+        "作业目录\n"
+        "作业保存在 %LOCALAPPDATA%\\Prana\\modeling\\<会话标识>-<时间戳>\\，"
+        "包含 source.json、work.blend、renders\\、scripts\\、export\\、"
+        "addon\\<名称>\\ 和 logs\\。Blender 崩溃后可从 work.blend 继续。\n\n"
+        "安装与限制\n"
+        "程序不会自动安装 addon，也不会修改老师已有的 addons；请手动把 "
+        "addon\\<名称>\\ 复制到 garrysmod/addons。身体与手模分别注册，"
+        "模型质量为程序化建模水平，动作、ragdoll、材质和第一人称手模仍需人工验收。",
+    ),
+    (
         "常见问题与数据",
         "无法发送或请求失败\n"
         "先检查 API Key、基础地址和模型名称是否正确，服务额度与网络是否可用。"
