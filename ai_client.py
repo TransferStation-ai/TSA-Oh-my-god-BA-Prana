@@ -753,6 +753,8 @@ class AIClient:
         review_model: str | None = None,
         brainstorm_rounds: int | None = None,
         linked_providers: list[dict[str, object]] | None = None,
+        game: dict[str, object] | None = None,
+        modeling: dict[str, object] | None = None,
     ) -> None:
         api_key = api_key.strip()
         base_url = base_url.strip().rstrip("/")
@@ -791,6 +793,11 @@ class AIClient:
             raise ValueError("头脑风暴轮数必须在 1-50 之间。")
         self._validate_linked_providers(linked_providers)
         self._validate_subagents(subagents)
+        extra_settings: dict[str, dict[str, object]] = {}
+        if game is not None:
+            extra_settings["game"] = game
+        if modeling is not None:
+            extra_settings["modeling"] = modeling
         settings_store.save_settings(
             api_key,
             base_url,
@@ -801,6 +808,7 @@ class AIClient:
             review_model,
             brainstorm_rounds=brainstorm_rounds,
             linked_providers=linked_providers,
+            **extra_settings,
         )
         self.api_key = api_key
         self.base_url = base_url
@@ -811,6 +819,10 @@ class AIClient:
         self.subagents = subagents
         self.brainstorm_rounds = brainstorm_rounds
         self.linked_providers = linked_providers
+        if game is not None:
+            self.game_settings = settings_store.normalize_game(game)
+        if modeling is not None:
+            self.modeling_settings = settings_store.normalize_modeling(modeling)
 
     def generate_image(self, prompt: str) -> Path:
         prompt = prompt.strip()

@@ -529,6 +529,19 @@ class _ModelingSessionAccessAdapter:
         return self._session().stop()
 
 
+def _collect_modeling_settings(
+    current: dict[str, str], values: dict[str, str]
+) -> dict[str, str]:
+    merged = {
+        key: str(current.get(key, default))
+        for key, default in settings_store.DEFAULT_MODELING_SETTINGS.items()
+    }
+    for key in merged:
+        if key in values:
+            merged[key] = str(values[key]).strip()
+    return merged
+
+
 class PranaApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -1332,6 +1345,43 @@ class PranaApp:
             entry.insert(0, str(self.ai_client.game_settings.get(key, "")))
             game_entries[key] = entry
 
+        modeling_entries: dict[str, tk.Entry] = {}
+        tk.Label(
+            content,
+            text="建模工具路径",
+            bg=BACKGROUND,
+            fg=TEXT,
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor=tk.W, pady=(16, 0))
+        for label, key in (
+            (
+                "Blender 可执行文件路径（必填，如 D:\\mc\\blender-3.0.1-windows-x64\\blender.exe）",
+                "blender_path",
+            ),
+            ("Blockbench 可执行文件路径（可选，仅作建模参考）", "blockbench_path"),
+            ("Garry's Mod 根目录（可选，用于查找 studiomdl）", "gmod_dir"),
+            ("SFM 根目录（可选，作为 Source 工具回退）", "sfm_dir"),
+        ):
+            tk.Label(
+                content,
+                text=label,
+                bg=BACKGROUND,
+                fg=TEXT,
+                font=("Segoe UI", 9),
+            ).pack(anchor=tk.W, pady=(7, 3))
+            entry = tk.Entry(
+                content,
+                bg="#292a36",
+                fg=TEXT,
+                insertbackground=TEXT,
+                relief=tk.FLAT,
+                borderwidth=0,
+                font=("Segoe UI", 10),
+            )
+            entry.pack(fill=tk.X, ipady=7)
+            entry.insert(0, str(self.ai_client.modeling_settings.get(key, "")))
+            modeling_entries[key] = entry
+
         def display_catalog(entry: dict[str, object]) -> None:
             model_list.delete(0, tk.END)
             models = entry.get("models", [])
@@ -1501,6 +1551,7 @@ class PranaApp:
                         models=self.ai_client.model_catalog,
                         vault_key=self.ai_client.vault_key,
                         game=self.ai_client.game_settings,
+                        modeling=self.ai_client.modeling_settings,
                     )
                 except (OSError, RuntimeError, ValueError) as save_error:
                     model_catalog_status.set(
@@ -1791,6 +1842,13 @@ class PranaApp:
                         for key, entry in game_entries.items()
                     },
                 }
+                modeling_settings = _collect_modeling_settings(
+                    self.ai_client.modeling_settings,
+                    {
+                        key: entry.get()
+                        for key, entry in modeling_entries.items()
+                    },
+                )
                 self.ai_client.save_configuration(
                     api_key,
                     address,
@@ -1810,6 +1868,7 @@ class PranaApp:
                     ],
                     vault_key=target_key,
                     game=game_settings,
+                    modeling=modeling_settings,
                 )
             except (OSError, RuntimeError, ValueError) as error:
                 messagebox.showerror(
@@ -5590,6 +5649,19 @@ class PranaApp:
                 )
             return state.session
 
+    def _modeling_session(self, session_id: str) -> ModelingSession:
+        with self.state_lock:
+            state = self.modeling_sessions.setdefault(
+                session_id, _ModelingSessionState()
+            )
+            if state.session is None:
+                state.session = ModelingSession(
+                    session_id=session_id,
+                    settings=self.ai_client.modeling_settings,
+                    data_dir=settings_store.settings_file_path().parent,
+                )
+            return state.session
+
     def _append_game_event(
         self,
         session_id: str,
@@ -5650,12 +5722,20 @@ class PranaApp:
             self.desktop_sessions.clear()
             game_states = list(self.game_sessions.values())
             self.game_sessions.clear()
+            modeling_states = list(self.modeling_sessions.values())
+            self.modeling_sessions.clear()
         for state in states:
             state.authorized = False
             state.stop_event.set()
             if state.watchdog_stop is not None:
                 state.watchdog_stop()
         for state in game_states:
+            if state.session is not None:
+                try:
+                    state.session.close()
+                except (OSError, RuntimeError):
+                    pass
+        for state in modeling_states:
             if state.session is not None:
                 try:
                     state.session.close()
