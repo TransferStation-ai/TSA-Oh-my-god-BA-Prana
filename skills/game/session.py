@@ -18,6 +18,20 @@ from skills.game.mc import (
     prepare_skin,
 )
 from skills.game.probe import detect_local_mc
+from skills.game.gm import (
+    GmConsole,
+    GmConsoleError,
+    GmProbeError,
+    a2s_info,
+    detect_local_gm,
+    gm_follow_script,
+    gm_join_script,
+    gm_leave_script,
+    gm_say_script,
+    gm_scan_script,
+    gm_stop_script,
+    run_lua_snippet,
+)
 
 
 class GameSessionError(RuntimeError):
@@ -41,6 +55,7 @@ class GameSession:
         | None = None,
         body_factory: Callable[..., McBody] | None = None,
         body_command: list[str] | None = None,
+        gm_console_factory: Callable[..., GmConsole] | None = None,
     ) -> None:
         self.game_settings = dict(game_settings)
         self.data_dir = Path(data_dir)
@@ -50,10 +65,15 @@ class GameSession:
         self.custom_skills = GameSkillStore(self.data_dir / "game_skills")
         self.body_factory = body_factory or McBody
         self.body_command = body_command
+        self.gm_console_factory = gm_console_factory
         self.body: McBody | None = None
         self.brain: GameBrain | None = None
         self._active_game: str | None = None
         self._lock = threading.RLock()
+        self._gm_console: GmConsole | None = None
+        self._gm_host: str = ""
+        self._gm_port: int = 0
+        self._gm_npc: bool = False
 
     @property
     def active_game(self) -> str | None:
@@ -62,14 +82,29 @@ class GameSession:
     def probe(
         self, game: str, port: int | None = None
     ) -> dict[str, object]:
-        if game != "mc":
-            raise ValueError("一期只支持 Minecraft。")
+        if game not in ("mc", "gm"):
+            raise ValueError("一期只支持 Minecraft 或 GMod。")
         if port is not None and (
             isinstance(port, bool)
             or not isinstance(port, int)
             or not 1 <= port <= 65535
         ):
             raise ValueError("端口必须在 1-65535 之间。")
+        if game == "gm":
+            servers = (
+                detect_local_gm()
+                if port is None
+                else detect_local_gm((port,))
+            )
+            return {
+                "found": bool(servers),
+                "servers": servers,
+                "hint": (
+                    "已找到本地 GMod 服务器。"
+                    if servers
+                    else "未找到本地 GMod 服务器，请先以 listen 模式启动 GMod（默认端口 27015）。"
+                ),
+            }
         servers = (
             detect_local_mc()
             if port is None
@@ -93,8 +128,10 @@ class GameSession:
         player_name: str = "",
         version: str | None = None,
     ) -> dict[str, object]:
-        if game != "mc":
-            raise ValueError("一期只支持 Minecraft。")
+        if game not in ("mc", "gm"):
+            raise ValueError("一期只支持 Minecraft 或 GMod。")
+        if game == "gm":
+            return self._join_gm(host, port, player_name)
         with self._lock:
             if self._active_game is not None:
                 self.leave(self._active_game)
@@ -164,6 +201,82 @@ class GameSession:
             }
             self.on_event("joined", result)
             return result
+
+    def _join_gm(
+        self, host: str, port: int, player_name: str
+    ) -> dict[str, object]:
+        with self._lock:
+            if self._active_game is not None:
+                self.leave(self._active_game)
+            console = self._make_gm_console(
+                host,
+                port,
+                self.game_settings.get("gm_password", ""),
+            )
+            try:
+                console.connect()
+                run_lua_snippet(console, gm_join_script(npc_name=player_name or "普拉娜"))
+            except GmConsoleError as error:
+                console.close()
+                raise GameSessionError(
+                    f"无法加入 GMod 会话：{error}"
+                ) from error
+            self._gm_console = console
+            self._gm_host = host
+            self._gm_port = port
+            self._gm_npc = True
+            self._active_game = "gm"
+            result = {
+                "game": "gm",
+                "host": host,
+                "port": port,
+                "player_name": player_name or "普拉娜",
+                "npc": "已生成",
+            }
+            self.on_event("joined", result)
+            return result
+
+    def _make_gm_console(
+        self, host: str, port: int, password: str
+    ) -> GmConsole:
+        factory = self.gm_console_factory
+        if factory is not None:
+            return factory(
+                host,
+                port,
+                password=password,
+                on_chat=self._on_gm_chat,
+                on_disconnect=self._on_gm_disconnect,
+            )
+        return GmConsole(
+            host,
+            port,
+            password=password,
+            on_chat=self._on_gm_chat,
+            on_disconnect=self._on_gm_disconnect,
+        )
+
+    def _on_gm_chat(self, payload: str) -> None:
+        self.on_event(
+            "chat",
+            {"type": "chat", "message": payload, "game": "gm"},
+        )
+
+    def _on_gm_disconnect(self) -> None:
+        with self._lock:
+            if self._active_game != "gm":
+                return
+            console = self._gm_console
+            self._active_game = None
+            self._gm_npc = False
+            if console is not None:
+                try:
+                    run_lua_snippet(console, gm_leave_script())
+                except (GmConsoleError, ValueError):
+                    pass
+                console.close()
+            self._gm_console = None
+        self.on_event("error", {"message": "GMod 控制台连接已断开。"})
 
     def _on_body_event(self, event: dict[str, object]) -> None:
         name = event.get("event")
@@ -312,6 +425,10 @@ class GameSession:
         max_distance: int = 24,
         count: int = 1,
     ) -> dict[str, object]:
+        if game == "gm":
+            return self._command_gm(
+                action, target=target, text=text, max_distance=max_distance
+            )
         if game != self._active_game or game != "mc":
             raise GameSessionError("当前没有运行中的 Minecraft 会话。")
         body = self.body
@@ -356,12 +473,79 @@ class GameSession:
             raise ValueError("未知的游戏动作。")
         return {"ok": True, "action": action}
 
+    def _command_gm(
+        self,
+        action: str,
+        *,
+        target: str = "",
+        text: str = "",
+        max_distance: int = 24,
+    ) -> dict[str, object]:
+        if self._active_game != "gm":
+            raise GameSessionError("当前没有运行中的 GMod 会话。")
+        console = self._gm_console
+        if console is None:
+            raise GameSessionError("GMod 控制台当前未连接。")
+        if action == "status":
+            try:
+                info = a2s_info(self._gm_host, self._gm_port)
+            except GmProbeError as error:
+                return {
+                    "ok": True,
+                    "action": action,
+                    "feedback": False,
+                    "message": f"无法读取 GMod 状态：{error}",
+                }
+            return {
+                "ok": True,
+                "action": action,
+                "feedback": True,
+                "name": info.get("name", ""),
+                "map": info.get("map", ""),
+                "players": info.get("players", 0),
+                "max_players": info.get("max_players", 0),
+            }
+        if action == "say":
+            result = run_lua_snippet(console, gm_say_script(text))
+        elif action == "follow":
+            result = run_lua_snippet(console, gm_follow_script(target))
+        elif action == "stop":
+            result = run_lua_snippet(console, gm_stop_script())
+        elif action == "scan":
+            result = run_lua_snippet(console, gm_scan_script())
+        else:
+            raise ValueError("未知的 GMod 动作。")
+        out: dict[str, object] = {
+            "ok": True,
+            "action": action,
+            "feedback": result["feedback"],
+        }
+        if action == "scan":
+            payload = result.get("json")
+            if isinstance(payload, dict):
+                out["players"] = payload.get("players", [])
+                out["npc"] = payload.get("npc")
+        if not result["feedback"]:
+            out["message"] = "控制台未回传确认，指令已发送。"
+        return out
+
     def status(self, game: str) -> dict[str, object]:
+        if game == "gm":
+            if self._active_game != "gm" or self._gm_console is None:
+                raise GameSessionError("当前没有运行中的 GMod 会话。")
+            return {
+                "game": "gm",
+                "host": self._gm_host,
+                "port": self._gm_port,
+                "npc": "已生成" if self._gm_npc else "未生成",
+            }
         if game != self._active_game or self.body is None:
             raise GameSessionError("当前没有运行中的游戏会话。")
         return self.body.status()
 
     def leave(self, game: str) -> dict[str, object]:
+        if game == "gm":
+            return self._leave_gm()
         if game != "mc":
             raise ValueError("当前没有对应的游戏会话。")
         if self._active_game is None and self.body is None and self.brain is None:
@@ -388,6 +572,23 @@ class GameSession:
         if first_error is not None:
             raise GameSessionError(f"结束游戏会话时发生错误：{first_error}") from first_error
         return {"ok": True, "game": "mc"}
+
+    def _leave_gm(self) -> dict[str, object]:
+        with self._lock:
+            if self._active_game != "gm":
+                raise ValueError("当前没有对应的游戏会话。")
+            console = self._gm_console
+            if console is not None:
+                try:
+                    run_lua_snippet(console, gm_leave_script())
+                except (GmConsoleError, ValueError):
+                    pass
+                console.close()
+            self._gm_console = None
+            self._gm_npc = False
+            self._active_game = None
+            self.on_event("left", {"game": "gm"})
+            return {"ok": True, "game": "gm"}
 
     def close(self) -> None:
         if self._active_game is None:

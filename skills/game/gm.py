@@ -5,6 +5,7 @@ import socket
 import struct
 import threading
 import time
+from typing import Callable
 
 GM_PROBE_HOST = "127.0.0.1"
 GM_PROBE_PORTS = (27015,)
@@ -125,6 +126,8 @@ class GmConsole:
         timeout: float = GM_CONNECT_TIMEOUT,
         quiet: float = GM_QUIET_WINDOW,
         sock_factory=None,
+        on_chat: Callable[[str], None] | None = None,
+        on_disconnect: Callable[[], None] | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -138,9 +141,12 @@ class GmConsole:
         self._lines: list[str] = []
         self._lines_lock = threading.Lock()
         self._closed = False
+        self._closing = False
         self._closed_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._password_sent = False
+        self._on_chat = on_chat
+        self._on_disconnect = on_disconnect
 
     @property
     def closed(self) -> bool:
@@ -165,6 +171,7 @@ class GmConsole:
         self._reader.start()
 
     def _read_loop(self) -> None:
+        disconnected = False
         try:
             reader = self._reader_file
             if reader is None:
@@ -172,15 +179,23 @@ class GmConsole:
             while not self.closed:
                 data = reader.readline()
                 if not data:
+                    disconnected = True
                     break
                 line = data.decode("utf-8", "replace").rstrip("\r\n")
                 with self._lines_lock:
                     self._lines.append(line)
+                if line.startswith(_GM_CHAT_MARKER):
+                    if self._on_chat is not None:
+                        self._on_chat(
+                            line[len(_GM_CHAT_MARKER):].lstrip()
+                        )
         except (OSError, ValueError):
-            pass
+            disconnected = True
         finally:
             with self._closed_lock:
                 self._closed = True
+            if disconnected and not self._closing and self._on_disconnect is not None:
+                self._on_disconnect()
 
     def _send_line(self, line: str) -> None:
         if self._sock is None:
@@ -257,6 +272,8 @@ class GmConsole:
         }
 
     def close(self) -> None:
+        with self._closed_lock:
+            self._closing = True
         if self._sock is not None:
             with self._write_lock:
                 try:
