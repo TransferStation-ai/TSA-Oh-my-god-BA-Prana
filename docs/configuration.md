@@ -4,15 +4,22 @@
 
 ## 服务商与模型
 
-内置服务商的 API 基础地址如下：
+内置服务商的连接方式如下：
 
-| 服务商 | API 基础地址 |
+| 服务商 | 连接方式 |
 | --- | --- |
 | Agnes AI | `https://apihub.agnes-ai.com/v1` |
 | OpenAI（GPT 官方） | `https://api.openai.com/v1` |
 | kimi（kimi 官方） | `https://api.moonshot.cn/v1` |
+| GitHub Copilot | GitHub 官方 Copilot SDK/CLI（无需 API 地址或 API Key） |
 
-点击侧栏服务商可打开设置并预填 API 地址。设置顶部菜单可以切换内置服务、已保存的链接/自定义服务或“自定义地址…”。每家服务商的 API Key 分别保存；切换后 Key 留空即复用该服务商已保存的凭据。对话模型可从已保存或实时获取的目录中选择，也可手动输入。刷新模型列表会请求目标服务的 `GET /models`；失败时保留原目录，不影响手动切换。切换服务商只影响后续消息，不更改已有会话历史。
+点击侧栏服务商可打开设置并预填连接信息。设置顶部菜单可以切换内置服务、已保存的链接/自定义服务或“自定义地址…”。API Key 按服务商分别保存；切换后 Key 留空即复用该服务商已保存的凭据。对话模型可从已保存或实时获取的目录中选择，也可手动输入。刷新 OpenAI 兼容服务的模型列表会请求 `GET /models`；Copilot 则通过 SDK 获取可用模型。失败时保留原目录，不影响手动切换。切换服务商只影响后续消息，不更改已有会话历史。
+
+### GitHub Copilot
+
+GitHub Copilot 通过 [GitHub 官方 Copilot SDK](https://github.com/github/copilot-sdk) 调用 Copilot CLI 运行时，需要可使用 Copilot 的 GitHub 账号/订阅。首次使用前请在终端登录 Copilot CLI，或登录已安装的 GitHub CLI；SDK 会复用本机登录凭据，不要求也不会在 Prana 设置中保存 API Key。首次启动 SDK 运行时可能需要联网下载组件。模型可选 `auto` 自动路由，也可在设置中刷新并选择当前账号可用的模型。
+
+Copilot 的内置 CLI 文件/终端工具不会开放给 Prana。模型请求的 Prana Skills 仍由应用原有的执行与操作审查流程处理。Copilot SDK 模式目前不转发图片/视频附件，也不支持图片或视频生成；这些能力需切换到支持对应媒体接口的提供商。GitHub Copilot 订阅与已退役的 GitHub Models API 是不同服务。
 
 图片生成模型、视频生成模型和操作审查模型按服务商分别保存；目标服务没有审查模型时会清空该项，敏感操作继续 fail-closed。图片或视频模型留空时，对应功能会提示尚未配置。“取消”会保留原设置。
 
@@ -20,7 +27,7 @@
 
 使用 Agnes AI 图片生成时，可将 API 地址设为 `https://apihub.agnes-ai.com/v1`，图片生成模型设为 `agnes-image-2.0-flash`；请求尺寸为 `1024x1024`。使用 Agnes Video 2.5 时，将视频生成模型设为 `agnes-video-2.5` 并使用相同 API 地址；应用会发送 `mode: "text"`，按 Agnes 接口轮询任务并下载结果。
 
-所有模型服务需支持 OpenAI Chat Completions tool calling 才能使用 Skills。媒体生成功能还需要相应的图片/视频生成接口；图片生成使用 OpenAI 风格 `POST /images/generations`，调用可能产生额外费用。桌面截图和图片/视频分析还需要模型服务支持图像输入。
+OpenAI 兼容服务需支持 Chat Completions tool calling 才能使用 Skills；Copilot 使用官方 SDK 的自定义工具接口。媒体生成功能还需要相应的图片/视频生成接口；图片生成使用 OpenAI 风格 `POST /images/generations`，调用可能产生额外费用。桌面截图和图片/视频分析还需要模型服务支持图像输入。
 
 ## 子代理与链接提供商
 
@@ -36,7 +43,7 @@
 
 | 环境变量 | 必需 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `PRANA_API_KEY` | 否（可在界面设置） | 无 | AI 服务 API Key |
+| `PRANA_API_KEY` | 否（可在界面设置） | 无 | OpenAI 兼容 AI 服务 API Key；Copilot 使用本机 CLI 登录，不读取此项 |
 | `PRANA_API_BASE_URL` | 否 | `https://api.openai.com/v1` | OpenAI 兼容 API 基础地址 |
 | `PRANA_MODEL` | 否 | `gpt-4o-mini` | 对话模型名称 |
 | `PRANA_IMAGE_MODEL` | 否 | `gpt-image-1` | 图片生成模型名称 |
@@ -59,6 +66,7 @@ python main.py
 ## 本地数据与隐私
 
 - `%LOCALAPPDATA%\Prana\settings.json` 保存设置。API Key、子代理 Key 和链接提供商 Key 使用 Windows 当前用户的 DPAPI 加密，只有同一 Windows 用户可以解密。
+- Copilot 登录凭据由 GitHub Copilot CLI/GitHub CLI 管理，不保存在 Prana 设置文件中。
 - `%LOCALAPPDATA%\Prana\sessions\<会话 id>.json` 保存主会话、头脑风暴会话和参与者子会话；会话正文以明文保存在本机。删除主会话会一并删除其头脑风暴子会话；清空对话也会删除当前会话的子会话。
 - 游戏技能保存在 `%LOCALAPPDATA%\Prana\game_skills`；图片和视频生成文件保存在 `%LOCALAPPDATA%\Prana\media`。
 - 网页链接由本机直接访问；抓取的正文会连同消息和对话上下文发送至所选 AI 服务。头脑风暴也会将当前请求和近期对话发送给所有参与模型。请勿发送不应交由这些服务处理的敏感信息。

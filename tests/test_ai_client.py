@@ -99,6 +99,7 @@ class ToolExchangeRecorderTests(unittest.TestCase):
             "tool_calls": [tool_call],
         }
         exchanges: list[tuple[dict, list]] = []
+        events = []
 
         def record(assistant_message, tool_results):
             exchanges.append((assistant_message, tool_results))
@@ -116,6 +117,7 @@ class ToolExchangeRecorderTests(unittest.TestCase):
                     {"role": "user", "content": "现在几点"},
                 ],
                 tool_exchange_recorder=record,
+                on_event=lambda kind, text: events.append((kind, text)),
             )
 
         self.assertEqual(reply, "现在是 20:00。")
@@ -127,6 +129,12 @@ class ToolExchangeRecorderTests(unittest.TestCase):
         self.assertEqual(len(recorded_results), 1)
         self.assertEqual(recorded_results[0]["role"], "tool")
         self.assertEqual(recorded_results[0]["tool_call_id"], "call-time")
+        tool_events = [(kind, text) for kind, text in events if kind.startswith("tool_")]
+        self.assertEqual([kind for kind, _ in tool_events], ["tool_start", "tool_finish"])
+        start = json.loads(tool_events[0][1])
+        self.assertEqual(start["name"], "get_system_time")
+        self.assertEqual(start["arguments"], "{}")
+        self.assertEqual(json.loads(tool_events[1][1])["status"], "completed")
 
     def test_tool_exchange_recorder_is_called_for_multiple_rounds(self) -> None:
         client = AIClient(
@@ -512,6 +520,27 @@ class AIClientTests(unittest.TestCase):
 
         self.assertEqual(complete_once.call_count, 4)
 
+    def test_chat_request_does_not_retry_after_cancellation(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "",
+                "base_url": "copilot://sdk",
+                "model": "auto",
+            }
+        )
+        with patch(
+            "ai_client.copilot_provider.complete",
+            side_effect=RuntimeError("Copilot 请求已取消。"),
+        ) as complete, patch("ai_client.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "已取消"):
+                client._complete_message(
+                    [{"role": "user", "content": "停止"}],
+                    should_stop=lambda: True,
+                )
+
+        complete.assert_called_once()
+        sleep.assert_not_called()
+
     def test_save_configuration_persists_and_updates_client(self) -> None:
         with patch("ai_client.settings_store.load_settings", return_value={}), patch(
             "ai_client.settings_store.save_settings"
@@ -534,6 +563,9 @@ class AIClientTests(unittest.TestCase):
             "review-v1",
             brainstorm_rounds=10,
             linked_providers=[],
+            provider_vault={},
+            vault_models=None,
+            vault_key=None,
         )
         self.assertEqual(client.api_key, "new-key")
         self.assertEqual(client.base_url, "https://example.test/v1")
@@ -541,6 +573,40 @@ class AIClientTests(unittest.TestCase):
         self.assertEqual(client.review_model, "review-v1")
         self.assertEqual(client.brainstorm_rounds, 10)
         self.assertEqual(client.linked_providers, [])
+
+    def test_save_copilot_configuration_without_api_key(self) -> None:
+        with patch("ai_client.settings_store.load_settings", return_value={}), patch(
+            "ai_client.settings_store.save_settings", return_value={}
+        ) as save_settings:
+            client = AIClient()
+            client.save_configuration(
+                "",
+                "copilot://sdk",
+                "auto",
+                image_model="",
+                video_model="",
+            )
+
+        self.assertTrue(client.is_configured)
+        self.assertEqual(client.api_key, "")
+        self.assertEqual(client.vault_key, "preset:GitHub Copilot")
+        save_settings.assert_called_once()
+        self.assertEqual(save_settings.call_args.args[:3], ("", "copilot://sdk", "auto"))
+        self.assertEqual(save_settings.call_args.kwargs["vault_key"], None)
+
+    def test_fetching_copilot_models_uses_sdk_without_api_key(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "",
+                "base_url": "copilot://sdk",
+                "model": "auto",
+            }
+        )
+        models = [{"id": "auto", "name": "自动选择（Copilot）"}]
+        with patch("ai_client.copilot_provider.fetch_models", return_value=models) as fetch:
+            self.assertEqual(client.fetch_provider_models("copilot://sdk", ""), models)
+
+        fetch.assert_called_once_with()
 
     def test_brainstorm_participants_order_and_dedupe(self) -> None:
         client = AIClient(
@@ -1043,6 +1109,8 @@ class AIClientTests(unittest.TestCase):
                 "switch_workspace",
                 "read_git_repository",
                 "run_shell_command",
+                "search_minecraft_wiki",
+                "search_cnki",
             ],
         )
         self.assertEqual(
@@ -2487,6 +2555,48 @@ class AIClientTests(unittest.TestCase):
         self.assertIn("request_desktop_control", names)
         self.assertIn("control_desktop", names)
 
+    def test_public_reference_search_tools_are_offered_and_dispatched(self) -> None:
+        client = AIClient(
+            {
+                "api_key": "main-key",
+                "base_url": "https://main.test/v1",
+                "model": "main-model",
+            }
+        )
+        call = self._desktop_tool_call(
+            "call-cnki", "search_cnki", {"query": "机器学习"}
+        )
+        with (
+            patch.object(
+                client,
+                "_complete_message",
+                side_effect=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call],
+                    },
+                    {"role": "assistant", "content": "找到相关论文。"},
+                ],
+            ) as complete_message,
+            patch(
+                "ai_client.invoke_cnki_skill",
+                return_value='{"results":[]}',
+            ) as invoke,
+        ):
+            reply, _ = client.complete_with_media_skills(
+                [{"role": "user", "content": "找机器学习论文"}]
+            )
+
+        names = [
+            tool["function"]["name"]
+            for tool in complete_message.call_args_list[0].kwargs["tools"]
+        ]
+        self.assertIn("search_minecraft_wiki", names)
+        self.assertIn("search_cnki", names)
+        self.assertEqual(reply, "找到相关论文。")
+        invoke.assert_called_once_with({"query": "机器学习"})
+
     def test_desktop_authorization_requires_user_and_review_approval(self) -> None:
         client = AIClient(
             {
@@ -3301,7 +3411,11 @@ class StreamRequestTests(unittest.TestCase):
                 on_event=lambda kind, text: events.append((kind, text)),
             )
         self.assertEqual(reply, "答案")
-        self.assertEqual(events, [("reasoning", "想"), ("content", "答案")])
+        self.assertEqual(events, [
+            ("round", ""),
+            ("reasoning", "正在分析请求并规划下一步。"),
+            ("content", "答案"),
+        ])
         self.assertTrue(json.loads(urlopen.call_args.args[0].data)["stream"])
 
     def test_non_stream_body_falls_back_and_replays_once(self) -> None:
@@ -3314,7 +3428,11 @@ class StreamRequestTests(unittest.TestCase):
             reply = client.complete([{"role": "user", "content": "你好"}],
                                     on_event=lambda k, t: events.append((k, t)))
         self.assertEqual(reply, "答案")
-        self.assertEqual(events, [("reasoning", "想"), ("content", "答案")])
+        self.assertEqual(events, [
+            ("round", ""),
+            ("reasoning", "正在分析请求并规划下一步。"),
+            ("content", "答案"),
+        ])
         self.assertTrue(client._streaming_disabled)
         self.assertEqual(urlopen.call_count, 1)
 
@@ -3327,7 +3445,11 @@ class StreamRequestTests(unittest.TestCase):
             reply = client.complete([{"role": "user", "content": "你好"}],
                                     on_event=lambda k, t: events.append((k, t)))
         self.assertEqual(reply, "兜底")
-        self.assertEqual(events, [("content", "兜底")])
+        self.assertEqual(events, [
+            ("round", ""),
+            ("reasoning", "正在分析请求并规划下一步。"),
+            ("content", "兜底"),
+        ])
         self.assertTrue(client._streaming_disabled)
 
     def test_no_retry_after_partial_content(self) -> None:
@@ -3367,7 +3489,7 @@ class MediaSkillsStreamTests(unittest.TestCase):
                 [{"role": "user", "content": "在吗"}],
                 on_event=lambda kind, text: rounds.append(kind),
             )
-        self.assertEqual(rounds, ["round"])
+        self.assertEqual(rounds, ["round", "reasoning"])
 
     def test_media_skills_forwards_should_stop(self) -> None:
         client = AIClient({"api_key": "k", "base_url": "https://x.test/v1", "model": "m"})

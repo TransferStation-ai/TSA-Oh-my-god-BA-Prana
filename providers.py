@@ -38,6 +38,10 @@ class ProviderPreset:
     base_url: str
     image_model: str
     video_model: str
+    chat_model: str = ""
+    driver: str = "openai"
+    requires_api_key: bool = True
+    supports_media: bool = True
 
     def matches(self, base_url: str) -> bool:
         return normalize_base_url(base_url) == self.base_url
@@ -62,7 +66,24 @@ BUILTIN_PROVIDERS = (
         image_model="kimi-k3.1-pro",
         video_model="kimi-k3.1-pro",
     ),
+    ProviderPreset(
+        name="GitHub Copilot",
+        base_url="copilot://sdk",
+        image_model="",
+        video_model="",
+        chat_model="auto",
+        driver="copilot-sdk",
+        requires_api_key=False,
+        supports_media=False,
+    ),
 )
+
+
+def provider_for_base_url(base_url: str) -> ProviderPreset | None:
+    return next(
+        (provider for provider in BUILTIN_PROVIDERS if provider.matches(base_url)),
+        None,
+    )
 
 
 def preset_vault_key(preset_name: str) -> str:

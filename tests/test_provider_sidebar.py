@@ -143,6 +143,21 @@ class ProviderSidebarTests(unittest.TestCase):
         self.assertEqual(restored.model, "another-chat-model")
         self.assertIn("当前使用", self.button(self.root, "OpenAI").cget("text"))
 
+    def test_copilot_saves_without_an_api_key_or_media_models(self):
+        self.start_app()
+        self.button(self.root, "GitHub Copilot").invoke()
+        dialog = self.dialog()
+        fields = self.entries(dialog)
+        self.assertEqual(fields[2].get(), "auto")
+        self.assertEqual(fields[3].get(), "")
+        self.assertEqual(fields[4].get(), "")
+        self.button(dialog, "保存").invoke()
+
+        restored = AIClient()
+        self.assertEqual(restored.base_url, "copilot://sdk")
+        self.assertEqual(restored.api_key, "")
+        self.assertEqual(restored.model, "auto")
+
     def test_manual_address_change_cannot_bypass_key_isolation(self):
         # Catches checking only the clicked preset rather than the final address.
         self.start_app(configured=True)

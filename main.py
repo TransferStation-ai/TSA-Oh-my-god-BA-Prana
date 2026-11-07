@@ -22,6 +22,7 @@ from brainstorm import BrainstormEvent, BrainstormRunner
 from chat_session import split_message_segments, trim_history
 from help_content import HELP_SECTIONS, QUICK_START_PROMPTS
 import opencode_import
+import providers
 import settings_store
 from providers import (
     BUILTIN_PROVIDERS,
@@ -99,6 +100,9 @@ SYSTEM_PROMPT = (
     "遇到 Minecraft/MC 相关的知识问题时，回答前必须调用 "
     "search_minecraft_wiki 查询中文 Minecraft Wiki；根据搜索结果作答并给出条目链接。"
     "如果查询失败或没有相关条目，明确说明未能从 MC 百科查到，不要声称已查询或编造来源。"
+    "遇到学术论文、作者、期刊或研究文献问题时，可调用 search_cnki 搜索"
+    "中国知网公开检索页面；只能依据实际返回的题名和链接回答，不得声称能访问"
+    "受限摘要或全文。若知网要求安全验证，说明当前无法自动检索，不得绕过验证。"
     "当老师的问题复杂、需要多视角讨论或你希望先听取其他模型意见时，"
     "可以调用 start_brainstorm；该能力会产生额外 API 费用，简单问题不要调用。"
     "老师明确要求查看屏幕或操作键盘鼠标时，先调用 request_desktop_control "
@@ -197,7 +201,7 @@ def game_event_message(
 
 
 class ThinkingBlock:
-    """可折叠思考块：生成中显示 Thinking + 微光，完成后折叠为 ▸ Thought 7s。"""
+    """可折叠进度摘要：生成中显示状态，完成后折叠为耗时摘要。"""
 
     def __init__(self, parent: tk.Misc, wraplength: int) -> None:
         self.frame = tk.Frame(parent, bg=BACKGROUND)
@@ -253,7 +257,7 @@ class ThinkingBlock:
         self._wraplength = wraplength
 
     def begin(self) -> None:
-        self.title.configure(text="Thinking")
+        self.title.configure(text="处理中")
         self.icon.configure(text=THINKING_ICON_ACTIVE)
         self.body_frame.pack(fill=tk.X, padx=10)
         self._start_shimmer()
@@ -290,7 +294,7 @@ class ThinkingBlock:
 
     def finish(self, seconds: float) -> None:
         self._stop_shimmer()
-        self.title.configure(text="Thought", fg=MUTED)
+        self.title.configure(text="处理进度", fg=MUTED)
         self.subtitle.configure(text=streaming.format_reasoning_duration(seconds))
         self.icon.configure(text=THINKING_ICON_COLLAPSED)
         self.body_frame.pack_forget()
@@ -358,6 +362,77 @@ class ThinkingBlock:
         self.frame.destroy()
 
 
+class ToolCallBlock:
+    """可展开的工具调用卡片，只显示调用信息，不展示工具原始输出。"""
+
+    _STATUS_TEXT = {
+        "running": "执行中",
+        "completed": "已完成",
+        "failed": "失败",
+        "interrupted": "已中断",
+    }
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        wraplength: int,
+        name: str,
+        arguments: str,
+        status: str = "running",
+    ) -> None:
+        self.frame = tk.Frame(parent, bg=SURFACE_HOVER, padx=10, pady=6)
+        self.header = tk.Frame(self.frame, bg=SURFACE_HOVER)
+        self.header.pack(fill=tk.X)
+        self.icon = tk.Label(
+            self.header, text="⚙", bg=SURFACE_HOVER, fg=ACCENT,
+            font=("Segoe UI", 9),
+        )
+        self.icon.pack(side=tk.LEFT, padx=(0, 6))
+        self.name_label = tk.Label(
+            self.header, text=f"工具调用 · {name}", bg=SURFACE_HOVER,
+            fg=TEXT, font=("Segoe UI", 9, "bold"), anchor=tk.W,
+        )
+        self.name_label.pack(side=tk.LEFT)
+        self.status_label = tk.Label(
+            self.header, text="", bg=SURFACE_HOVER, fg=MUTED,
+            font=("Segoe UI", 9),
+        )
+        self.status_label.pack(side=tk.RIGHT, padx=(8, 0))
+        self.arguments_label = tk.Label(
+            self.frame,
+            text=arguments,
+            bg=CODE_BACKGROUND,
+            fg=CODE_TEXT,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            wraplength=max(200, wraplength - 50),
+            font=("Consolas", 9),
+        )
+        self.arguments_label.pack(fill=tk.X, pady=(6, 0))
+        self._expanded = False
+        self.arguments_label.pack_forget()
+        for widget in (self.frame, self.header, self.icon, self.name_label):
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", lambda _event: self.toggle())
+        self.set_status(status)
+
+    def set_status(self, status: str) -> None:
+        self.status_label.configure(
+            text=self._STATUS_TEXT.get(status, "未知状态"),
+            fg=ACCENT if status == "running" else MUTED,
+        )
+
+    def toggle(self) -> None:
+        if self._expanded:
+            self.arguments_label.pack_forget()
+        else:
+            self.arguments_label.pack(fill=tk.X, pady=(6, 0))
+        self._expanded = not self._expanded
+
+    def set_wraplength(self, value: int) -> None:
+        self.arguments_label.configure(wraplength=max(200, value - 50))
+
+
 @dataclass
 class ChatRequest:
     request_id: int
@@ -381,6 +456,7 @@ class _StreamView:
     bubble: tk.Frame | None = None
     label: tk.Label | None = None
     thinking: ThinkingBlock | None = None
+    tool_widgets: dict[str, ToolCallBlock] = field(default_factory=dict)
     finalized: bool = False
 
 
@@ -930,8 +1006,14 @@ class PranaApp:
 
         self.provider_buttons: list[tuple[ProviderPreset, tk.Button]] = []
         for provider in BUILTIN_PROVIDERS:
+            display_name = (
+                "Kimi（官方）"
+                if provider.name == "kimi（kimi官方）"
+                else provider.name
+            )
             button = tk.Button(
                 sidebar,
+                text=f"{display_name}\n点击配置",
                 command=lambda preset=provider: self._open_settings(preset),
                 bg=SURFACE_HOVER,
                 fg=TEXT,
@@ -950,7 +1032,11 @@ class PranaApp:
             self.provider_buttons.append((provider, button))
             tk.Label(
                 sidebar,
-                text=provider.base_url.removeprefix("https://"),
+                text=(
+                    "官方 Copilot SDK"
+                    if provider.driver == "copilot-sdk"
+                    else provider.base_url.removeprefix("https://")
+                ),
                 bg=SURFACE,
                 fg=MUTED,
                 wraplength=176,
@@ -1012,8 +1098,13 @@ class PranaApp:
             matched = matched or selected
             active = selected and configured
             status = "当前使用" if active else "待配置" if selected else "点击配置"
+            display_name = (
+                "Kimi（官方）"
+                if provider.name == "kimi（kimi官方）"
+                else provider.name
+            )
             button.configure(
-                text=f"{provider.name}\n{status}",
+                text=f"{display_name}\n{status}",
                 bg="#34324a" if active else SURFACE_HOVER,
                 fg=ACCENT if active else TEXT,
             )
@@ -1185,6 +1276,12 @@ class PranaApp:
         initial_models = initial_entry.get("models", [])
         if not isinstance(initial_models, list):
             initial_models = []
+        if (
+            not initial_models
+            and initial_provider is not None
+            and initial_provider.driver == "copilot-sdk"
+        ):
+            initial_models = [{"id": "auto", "name": "自动选择（Copilot）"}]
         initial_model = (
             self.ai_client.model
             if initial_key == current_key
@@ -1192,9 +1289,10 @@ class PranaApp:
             or (
                 str(initial_models[0].get("id", ""))
                 if initial_models and isinstance(initial_models[0], dict)
-                else ""
+                else (initial_provider.chat_model if initial_provider else "")
             )
         )
+        field_labels: list[tk.Label] = []
         for label, value, secret in (
             (
                 "API Key（留空或保持提示值可保留；新提供商首次配置时填写）",
@@ -1220,11 +1318,15 @@ class PranaApp:
                 str(
                     initial_entry.get("image_model")
                     or (
-                        initial_provider.image_model
-                        if initial_provider and initial_key != current_key
-                        else ""
-                    )
-                ),
+                           self.ai_client.image_model
+                           if initial_key == current_key
+                           else (
+                               initial_provider.image_model
+                               if initial_provider
+                               else ""
+                           )
+                       )
+                   ),
                 False,
             ),
             (
@@ -1232,16 +1334,27 @@ class PranaApp:
                 str(
                     initial_entry.get("video_model")
                     or (
-                        initial_provider.video_model
-                        if initial_provider and initial_key != current_key
-                        else ""
+                        self.ai_client.video_model
+                        if initial_key == current_key
+                        else (
+                            initial_provider.video_model
+                            if initial_provider
+                            else ""
+                        )
                     )
                 ),
                 False,
             ),
             (
                 "操作审查模型（媒体、终端、工作区、桌面控制必填）",
-                str(initial_entry.get("review_model", "")),
+                str(
+                    initial_entry.get("review_model")
+                    or (
+                        self.ai_client.review_model
+                        if initial_key == current_key
+                        else ""
+                    )
+                ),
                 False,
             ),
             (
@@ -1250,13 +1363,15 @@ class PranaApp:
                 False,
             ),
         ):
-            tk.Label(
+            field_label = tk.Label(
                 content,
                 text=label,
                 bg=BACKGROUND,
                 fg=TEXT,
                 font=("Segoe UI", 9),
-            ).pack(anchor=tk.W, pady=(8, 4))
+            )
+            field_label.pack(anchor=tk.W, pady=(8, 4))
+            field_labels.append(field_label)
             entry = tk.Entry(
                 content,
                 bg="#292a36",
@@ -1428,9 +1543,29 @@ class PranaApp:
                 ),
                 None,
             )
+            requires_api_key = preset is None or preset.requires_api_key
+            api_key_entry.configure(state=tk.NORMAL)
             api_key_entry.delete(0, tk.END)
+            field_labels[0].configure(
+                text=(
+                    "API Key（留空或保持提示值可保留；新提供商首次配置时填写）"
+                    if requires_api_key
+                    else "GitHub Copilot 登录（使用本机 Copilot CLI/GitHub CLI 账号）"
+                )
+            )
+            field_labels[1].configure(
+                text=(
+                    "API 基础地址（OpenAI 官方用 Responses，其他用 Chat Completions）"
+                    if preset is None or preset.driver != "copilot-sdk"
+                    else "连接方式（GitHub 官方 Copilot SDK）"
+                )
+            )
             api_key_hint.set(
-                f"已保存 API Key：{entry.get('api_key_hint') or '未配置'}"
+                (
+                    f"已保存 API Key：{entry.get('api_key_hint') or '未配置'}"
+                    if requires_api_key
+                    else "不需要 API Key；请先登录 Copilot CLI 或 GitHub CLI。"
+                )
             )
             base_url_entry.configure(
                 state=tk.NORMAL if key == "custom-entry" else tk.DISABLED
@@ -1447,6 +1582,8 @@ class PranaApp:
             models = entry.get("models", [])
             if not isinstance(models, list):
                 models = []
+            if not models and preset is not None and preset.driver == "copilot-sdk":
+                models = [{"id": "auto", "name": "自动选择（Copilot）"}]
             model_entry.delete(0, tk.END)
             if key == current_key:
                 model_entry.insert(0, self.ai_client.model)
@@ -1454,6 +1591,8 @@ class PranaApp:
                 model_entry.insert(0, str(entry["model"]))
             elif models and isinstance(models[0], dict):
                 model_entry.insert(0, str(models[0].get("id", "")))
+            elif preset is not None and preset.chat_model:
+                model_entry.insert(0, preset.chat_model)
             for field_entry, field_name, default in (
                 (image_model_entry, "image_model", preset.image_model if preset else ""),
                 (video_model_entry, "video_model", preset.video_model if preset else ""),
@@ -1461,27 +1600,55 @@ class PranaApp:
             ):
                 field_entry.delete(0, tk.END)
                 field_entry.insert(0, str(entry.get(field_name) or default))
-            display_catalog(entry)
+            display_catalog({"models": models})
             model_catalog_status.set(
-                f"已保存 {len(models)} 个模型"
+                (
+                    "可使用自动选择；登录后可刷新可用模型。"
+                    if preset is not None
+                    and preset.driver == "copilot-sdk"
+                    and len(models) == 1
+                    else f"已保存 {len(models)} 个模型"
+                )
                 if models
                 else "暂无模型目录，可刷新或手动输入模型名。"
             )
-            if key != "custom-entry":
+            if key != "custom-entry" and not (
+                provider is None and key == current_key
+            ):
                 base_url_entry.configure(state=tk.DISABLED)
+            api_key_entry.configure(
+                state=tk.NORMAL if requires_api_key else tk.DISABLED
+            )
 
         api_key_hint.set(
-            f"已保存 API Key：{initial_entry.get('api_key_hint') or '未配置'}"
+            (
+                f"已保存 API Key：{initial_entry.get('api_key_hint') or '未配置'}"
+                if initial_provider is None or initial_provider.requires_api_key
+                else "不需要 API Key；请先登录 Copilot CLI 或 GitHub CLI。"
+            )
         )
-        display_catalog(initial_entry)
+        display_catalog({"models": initial_models})
         model_catalog_status.set(
-            f"已保存 {len(initial_models)} 个模型"
+            (
+                "可使用自动选择；登录后可刷新可用模型。"
+                if initial_provider is not None
+                and initial_provider.driver == "copilot-sdk"
+                and len(initial_models) == 1
+                else f"已保存 {len(initial_models)} 个模型"
+            )
             if initial_models
             else "暂无模型目录，可刷新或手动输入模型名。"
         )
-        if initial_key != "custom-entry":
+        if initial_key != "custom-entry" and not (
+            provider is None and initial_key == current_key
+        ):
             base_url_entry.configure(state=tk.DISABLED)
-
+        if initial_provider is not None and not initial_provider.requires_api_key:
+            field_labels[0].configure(
+                text="GitHub Copilot 登录（使用本机 Copilot CLI/GitHub CLI 账号）"
+            )
+            field_labels[1].configure(text="连接方式（GitHub 官方 Copilot SDK）")
+            api_key_entry.configure(state=tk.DISABLED)
         def refresh_models() -> None:
             key = selected_key()
             address = normalize_base_url(base_url_entry.get())
@@ -1540,7 +1707,12 @@ class PranaApp:
                     "base_url": address,
                     "api_key": api_key,
                     "api_key_hint": (
-                        "…" + api_key[-4:] if len(api_key) > 4 else "…"
+                        (
+                            "…" + api_key[-4:] if len(api_key) > 4 else "…"
+                        )
+                        if providers.provider_for_base_url(address) is None
+                        or providers.provider_for_base_url(address).requires_api_key
+                        else ""
                     ),
                     "models": models,
                 }
@@ -1816,14 +1988,21 @@ class PranaApp:
                 else:
                     target_key = selected_provider_key
                 target_entry = vault_entries.get(target_key, {})
-                if (
+                target_preset = providers.provider_for_base_url(address)
+                requires_api_key = (
+                    target_preset is None or target_preset.requires_api_key
+                )
+                if not requires_api_key:
+                    api_key = ""
+                elif (
                     not typed_key
-                    or typed_key == str(target_entry.get("api_key_hint", ""))
+                    or typed_key
+                    == str(selected_provider_entry.get("api_key_hint", ""))
                 ):
                     api_key = str(target_entry.get("api_key", "")).strip()
                 else:
                     api_key = typed_key
-                if not api_key:
+                if requires_api_key and not api_key:
                     raise ValueError(
                         "该提供商还没有保存 Key，请填写 API Key。"
                     )
@@ -1940,7 +2119,10 @@ class PranaApp:
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.RIGHT)
         self._center_window(dialog, self.root)
-        api_key_entry.focus_set()
+        if initial_provider is not None and not initial_provider.requires_api_key:
+            model_entry.focus_set()
+        else:
+            api_key_entry.focus_set()
 
     def _open_help(
         self, section: str = "快速开始", *, parent: tk.Toplevel | None = None
@@ -3121,6 +3303,7 @@ class PranaApp:
             media_paths=media_paths,
             on_retry=on_retry,
             reasoning_blocks=message.get("reasoning_blocks"),
+            activity_blocks=message.get("activity_blocks"),
         )
 
     @staticmethod
@@ -4717,6 +4900,11 @@ class PranaApp:
         self, view: _StreamView
     ) -> Callable[[str, str], None]:
         def on_event(kind: str, text: str) -> None:
+            if (
+                kind == "reasoning"
+                and text != streaming.PUBLIC_PROGRESS_SUMMARY
+            ):
+                return
             view.buffer.push(kind, text)
             if view.buffer.request_wakeup():
                 self._post_to_ui(
@@ -4798,6 +4986,28 @@ class PranaApp:
                 view.thinking.finish(float(payload["seconds"]))
                 self.message_text_labels.extend(view.thinking.labels)
                 view.thinking = None
+        elif action == "tool_start":
+            activity = payload
+            if not isinstance(activity, dict):
+                return
+            self._ensure_stream_row(view)
+            call_id = str(activity["id"])
+            widget = ToolCallBlock(
+                view.column,
+                self._wraplength(),
+                str(activity["name"]),
+                str(activity["arguments"]),
+            )
+            widget.frame.pack(fill=tk.X, pady=(0, 4))
+            view.tool_widgets[call_id] = widget
+            self.message_text_labels.append((widget.arguments_label, 50))
+        elif action == "tool_finish":
+            activity = payload
+            if not isinstance(activity, dict):
+                return
+            widget = view.tool_widgets.get(str(activity["id"]))
+            if widget is not None:
+                widget.set_status(str(activity["status"]))
         elif action == "content":
             self._ensure_stream_row(view)
             self._ensure_stream_bubble(view)
@@ -4834,13 +5044,15 @@ class PranaApp:
         if view.finalized:
             return
         display, blocks = self._finalize_stream(view)
-        if not display:
+        activities = view.state.activity_blocks
+        if not display and not activities:
             return
         record = new_message(
             "assistant",
             display,
             display=display,
             reasoning_blocks=blocks or None,
+            activity_blocks=activities or None,
             visible=True,
             in_api=False,
         )
@@ -4854,6 +5066,7 @@ class PranaApp:
                 "assistant",
                 display,
                 reasoning_blocks=blocks or None,
+                activity_blocks=activities or None,
             )
 
     def _handle_reply(
@@ -4893,6 +5106,7 @@ class PranaApp:
         display, blocks = (
             self._finalize_stream(view) if view is not None else ("", [])
         )
+        activities = view.state.activity_blocks if view is not None else []
         active = self.active_session_id == request.session_id
         if error is not None and not display:
             record = new_message(
@@ -4903,6 +5117,7 @@ class PranaApp:
                 visible=True,
                 in_api=False,
                 retry_user_message_id=request.user_message_id,
+                activity_blocks=activities or None,
             )
             self._append_session_message(
                 request.session_id,
@@ -4915,6 +5130,7 @@ class PranaApp:
                     "assistant",
                     f"请求失败：{error}",
                     is_error=True,
+                    activity_blocks=activities or None,
                     on_retry=lambda: self._retry_persisted_message(
                         error_message_id
                     ),
@@ -4927,6 +5143,7 @@ class PranaApp:
                 display=final_display,
                 media_paths=generated_media,
                 reasoning_blocks=blocks or None,
+                activity_blocks=activities or None,
             )
             self._append_session_message(
                 request.session_id,
@@ -4939,6 +5156,7 @@ class PranaApp:
                     final_display,
                     media_paths=generated_media,
                     reasoning_blocks=blocks or None,
+                    activity_blocks=activities or None,
                 )
         elif display:
             record = new_message(
@@ -4946,6 +5164,7 @@ class PranaApp:
                 "",
                 display=display,
                 reasoning_blocks=blocks or None,
+                activity_blocks=activities or None,
                 in_api=False,
             )
             self._append_session_message(
@@ -4958,6 +5177,7 @@ class PranaApp:
                     "assistant",
                     display,
                     reasoning_blocks=blocks or None,
+                    activity_blocks=activities or None,
                 )
         elif generated_media:
             record = new_message(
@@ -5099,12 +5319,14 @@ class PranaApp:
                 if view is not None
                 else ("", [])
             )
-            if display:
+            activities = view.state.activity_blocks if view is not None else []
+            if display or activities:
                 partial = new_message(
                     "assistant",
                     display,
                     display=display,
                     reasoning_blocks=blocks or None,
+                    activity_blocks=activities or None,
                     visible=True,
                     in_api=False,
                 )
@@ -5118,6 +5340,7 @@ class PranaApp:
                         "assistant",
                         display,
                         reasoning_blocks=blocks or None,
+                        activity_blocks=activities or None,
                     )
             record = new_message(
                 "assistant",
@@ -5171,6 +5394,7 @@ class PranaApp:
         media_paths: list[Path] | None = None,
         on_retry: Callable[[], None] | None = None,
         reasoning_blocks: list[dict[str, object]] | None = None,
+        activity_blocks: list[dict[str, object]] | None = None,
     ) -> None:
         self._dismiss_welcome()
 
@@ -5179,7 +5403,7 @@ class PranaApp:
         row.pack(fill=tk.X)
         bubble_bg = "#34324a" if role == "user" else SURFACE
         wraplength = self._wraplength()
-        blocks = streaming.normalize_reasoning_blocks(reasoning_blocks)
+        blocks = streaming.normalize_public_progress_blocks(reasoning_blocks)
         container = row
         if blocks:
             container = tk.Frame(row, bg=BACKGROUND)
@@ -5190,6 +5414,21 @@ class PranaApp:
                 widget.finish(float(block["seconds"]))
                 widget.frame.pack(fill=tk.X, pady=(0, 4))
                 self.message_text_labels.extend(widget.labels)
+        activities = streaming.normalize_activity_blocks(activity_blocks)
+        if activities:
+            if container is row:
+                container = tk.Frame(row, bg=BACKGROUND)
+                container.pack(side=tk.LEFT, anchor=tk.W)
+            for activity in activities:
+                widget = ToolCallBlock(
+                    container,
+                    wraplength,
+                    str(activity["name"]),
+                    str(activity["arguments"]),
+                    str(activity["status"]),
+                )
+                widget.frame.pack(fill=tk.X, pady=(0, 4))
+                self.message_text_labels.append((widget.arguments_label, 50))
         bubble = tk.Frame(container, bg=bubble_bg, padx=14, pady=10)
         bubble.pack(side=tk.RIGHT if role == "user" else tk.LEFT)
         text_color = ERROR if is_error else MUTED if is_muted else TEXT

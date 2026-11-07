@@ -81,6 +81,7 @@ def new_message(
     tool_call_id: str | None = None,
     responses_metadata: dict[str, object] | None = None,
     reasoning_blocks: list[dict[str, object]] | None = None,
+    activity_blocks: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     message = {
         "id": new_id(),
@@ -109,6 +110,8 @@ def new_message(
         message[RESPONSES_METADATA] = deepcopy(responses_metadata)
     if reasoning_blocks:
         message["reasoning_blocks"] = [dict(block) for block in reasoning_blocks]
+    if activity_blocks:
+        message["activity_blocks"] = deepcopy(activity_blocks)
     return message
 
 

@@ -103,6 +103,7 @@ def test_save_configuration_forwards_modeling_settings(monkeypatch):
 
     def fake_save(*args, **kwargs):
         captured["kwargs"] = kwargs
+        return {}
 
     monkeypatch.setattr(ai_client_module.settings_store, "load_settings", lambda: {})
     monkeypatch.setattr(ai_client_module.settings_store, "save_settings", fake_save)

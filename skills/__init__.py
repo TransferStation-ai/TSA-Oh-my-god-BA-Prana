@@ -29,6 +29,7 @@ from skills.workspace import (
     validate_workspace_skill_arguments,
 )
 from skills.git import GIT_SKILLS, invoke_git_skill, validate_git_arguments
+from skills.cnki import CNKI_SKILLS, invoke_cnki_skill
 from skills.game import (
     GAME_SKILLS,
     GameSessionAccess,
@@ -46,6 +47,7 @@ from skills.modeling import (
 
 __all__ = [
     "CHAT_SKILLS",
+    "CNKI_SKILLS",
     "DESKTOP_SKILLS",
     "DesktopAccess",
     "GIT_SKILLS",
@@ -61,6 +63,7 @@ __all__ = [
     "TIME_SKILLS",
     "WORKSPACE_SKILLS",
     "invoke_desktop_skill",
+    "invoke_cnki_skill",
     "invoke_git_skill",
     "invoke_game_skill",
     "invoke_minecraft_wiki_skill",

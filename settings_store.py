@@ -292,9 +292,14 @@ def save_settings(
 ) -> dict[str, dict[str, object]]:
     path = settings_file_path()
     key = vault_key or providers.resolve_main_vault_key(base_url)
+    if provider_vault is None:
+        stored_vault = load_settings().get("provider_vault", {})
+        provider_vault = (
+            stored_vault if isinstance(stored_vault, dict) else {}
+        )
     vault = {
         entry_key: dict(entry)
-        for entry_key, entry in (provider_vault or {}).items()
+        for entry_key, entry in provider_vault.items()
     }
     entry = dict(vault.get(key) or {})
     preset = next(

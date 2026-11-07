@@ -23,6 +23,7 @@
 | 桌面 | `request_desktop_control`、`control_desktop` | 先请求授权，再查看屏幕或操作已打开的窗口。需要用户授权和操作审查；不会自动启动程序，Esc 长按可紧急停止。 |
 | QQ 音乐 | `control_qq_music` | 控制已运行的 QQ 音乐，包括播放、切歌、音量和搜索；搜索本身不会自动播放，搜索并播放会尝试确认播放结果。 |
 | Minecraft | `probe_game_server`、`join_game`、`game_command`、`leave_game`（game=mc）、`search_minecraft_wiki` | 探测/加入 Minecraft Java 服务器、执行陪玩动作、结束游戏会话，以及搜索中文 Minecraft Wiki。加入服务器须通过操作审查；百科搜索只返回有限条目和摘要。 |
+| 学术文献 | `search_cnki` | 搜索中国知网公开检索页面，返回可见的文献题名和链接；可能因知网安全验证而无法自动获取结果，摘要或全文可能需要账号或机构权限。不会绕过验证或访问受限全文。 |
 | GMod | `probe_game_server`、`join_game`、`game_command`、`leave_game`（game=gm） | 探测/加入本地 GMod 服务器（默认 `127.0.0.1:27015`，端口/密码可在游戏设置中配置）；普拉娜以 NPC 替身出现在单机 listen 世界，不启动 Node 本体、不经 Steam 客户端登录。可用动作 `say/follow/stop/scan/status`；游戏内其他玩家的话只透传为聊天数据，不是指令。 |
 | 建模 | `start_modeling_job`、`open_modeling_reference`、`run_blender_python`、`render_modeling_preview`、`compile_gmod_model`、`modeling_status`、`stop_modeling_job` | 启动 Blender 建模作业、查看参考模型、执行建模代码、渲染预览、编译 GMod 玩家模型和管理作业。`run_blender_python` 在当前用户权限下执行，不是安全沙箱。 |
 
