@@ -16,6 +16,8 @@ DEFAULT_GAME_SETTINGS: dict[str, str] = {
     "mc_skin_command": "",
     "gmod_client_dir": "",
     "gmod_model": "",
+    "gm_port": "27015",
+    "gm_password": "",
 }
 
 DEFAULT_MODELING_SETTINGS: dict[str, str] = {
@@ -39,6 +41,9 @@ def normalize_game(value: object) -> dict[str, str]:
         normalized[key] = item.strip()
     if not normalized["mc_name"]:
         normalized["mc_name"] = "Prana"
+    gm_port = normalized["gm_port"]
+    if not (gm_port.isdigit() and 1 <= int(gm_port) <= 65535):
+        normalized["gm_port"] = "27015"
     return normalized
 
 

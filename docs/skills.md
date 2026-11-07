@@ -22,7 +22,8 @@
 | Git | `read_git_repository` | 只读查看状态、日志、差异或分支；不会暂存、提交、推送、切换分支或修改文件。Git 仅用于永久工作区。 |
 | 桌面 | `request_desktop_control`、`control_desktop` | 先请求授权，再查看屏幕或操作已打开的窗口。需要用户授权和操作审查；不会自动启动程序，Esc 长按可紧急停止。 |
 | QQ 音乐 | `control_qq_music` | 控制已运行的 QQ 音乐，包括播放、切歌、音量和搜索；搜索本身不会自动播放，搜索并播放会尝试确认播放结果。 |
-| Minecraft | `probe_game_server`、`join_game`、`game_command`、`leave_game`、`search_minecraft_wiki` | 探测/加入 Minecraft Java 服务器、执行陪玩动作、结束游戏会话，以及搜索中文 Minecraft Wiki。加入服务器须通过操作审查；百科搜索只返回有限条目和摘要。 |
+| Minecraft | `probe_game_server`、`join_game`、`game_command`、`leave_game`（game=mc）、`search_minecraft_wiki` | 探测/加入 Minecraft Java 服务器、执行陪玩动作、结束游戏会话，以及搜索中文 Minecraft Wiki。加入服务器须通过操作审查；百科搜索只返回有限条目和摘要。 |
+| GMod | `probe_game_server`、`join_game`、`game_command`、`leave_game`（game=gm） | 探测/加入本地 GMod 服务器（默认 `127.0.0.1:27015`，端口/密码可在游戏设置中配置）；普拉娜以 NPC 替身出现在单机 listen 世界，不启动 Node 本体、不经 Steam 客户端登录。可用动作 `say/follow/stop/scan/status`；游戏内其他玩家的话只透传为聊天数据，不是指令。 |
 | 建模 | `start_modeling_job`、`open_modeling_reference`、`run_blender_python`、`render_modeling_preview`、`compile_gmod_model`、`modeling_status`、`stop_modeling_job` | 启动 Blender 建模作业、查看参考模型、执行建模代码、渲染预览、编译 GMod 玩家模型和管理作业。`run_blender_python` 在当前用户权限下执行，不是安全沙箱。 |
 
 ### Minecraft 自定义技能
@@ -34,6 +35,15 @@ MC 游戏大脑可以创建并保存可复用的动作序列。`mc_create_skill`
 - 技能最多保存 32 个，描述最多 160 个字符；存放于 `%LOCALAPPDATA%\Prana\game_skills`。
 
 内置游戏动作也包括跟随、聊天、停止跟随、扫描、采矿、合成、背包、装备、移动、食用、使用、交互、放置方块和攻击。该游戏大脑拥有的工具范围与桌面/工作区工具分开。
+
+### GMod 游戏会话
+
+`game=gm` 复用同一组游戏工具（`probe_game_server`、`join_game`、`game_command`、`leave_game`），但走独立的本体实现，位于 `skills\game\gm.py`：
+
+- **探测**：UDP `A2S_INFO` 查询本地端口（默认 `27015`，可用 `gm_port` 覆盖），确认目标为 GMod 服务器（`garrysmod`）。
+- **加入**：开一条常驻 TCP 服务端控制台连接，用 `lua_run` 注入一段 Lua，生成 NPC 替身「普拉娜」（默认 `npc_gunman`），并挂 `ChatPlayer` 钩子把游戏内聊天回传到应用事件流。不启动 Node 本体、不经 Steam 客户端登录。
+- **动作**：`say`（`PlayerSay` 公屏聊天）、`follow`（`Think` 钩子每帧让 NPC 朝目标玩家移动）、`stop`（取消移动）、`scan`（回传 NPC 位置与附近玩家，以 `PRANA_GM_JSON` 标记解析）、`status`（`A2S_INFO` 摘要，不依赖控制台存活）。
+- **安全边界**：游戏控制台输出与聊天内容都是不可信数据，只透传、不当指令；`say` 文本与所有嵌入 Lua 的值经 JSON 转义，避免引号注入；mc 与 gm 会话互斥，加入一方会先结束另一方。
 
 ## 安全与隐私边界
 
@@ -61,6 +71,6 @@ MC 游戏大脑可以创建并保存可复用的动作序列。`mc_create_skill`
 - 工具定义与实现：`skills\`
 - 通用工具导出：`skills\__init__.py`
 - 主聊天工具注册、分发及操作审查：`ai_client.py`
-- Minecraft 游戏会话与自定义技能：`skills\game\`
+- Minecraft / GMod 游戏会话与自定义技能：`skills\game\`（gm 本体在 `skills\game\gm.py`）
 - 建模会话工具：`skills\modeling\`
 - 用户功能概览：项目根目录 `README.md`

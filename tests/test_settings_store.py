@@ -338,6 +338,22 @@ class SettingsStoreTests(unittest.TestCase):
             [{"id": "m1", "name": "M1"}],
         )
 
+    def test_normalize_game_defaults_gm_port_and_password(self) -> None:
+        normalized = settings_store.normalize_game({})
+        self.assertEqual(normalized["gm_port"], "27015")
+        self.assertEqual(normalized["gm_password"], "")
+
+    def test_normalize_game_illegal_gm_port_falls_back_to_default(self) -> None:
+        normalized = settings_store.normalize_game({"gm_port": "99999"})
+        self.assertEqual(normalized["gm_port"], "27015")
+
+    def test_normalize_game_keeps_valid_custom_gm_port(self) -> None:
+        normalized = settings_store.normalize_game(
+            {"gm_port": "27020", "gm_password": "secret"}
+        )
+        self.assertEqual(normalized["gm_port"], "27020")
+        self.assertEqual(normalized["gm_password"], "secret")
+
 
 if __name__ == "__main__":
     unittest.main()
