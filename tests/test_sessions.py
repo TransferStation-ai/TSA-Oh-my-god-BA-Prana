@@ -275,6 +275,25 @@ class SessionStoreTests(unittest.TestCase):
         )]
         self.assertNotIn("reasoning_blocks", build_api_messages(session)[0])
 
+    def test_activity_blocks_are_persisted_but_not_sent_to_the_model(self) -> None:
+        activity = {
+            "id": "call-1",
+            "name": "get_system_time",
+            "arguments": "{}",
+            "status": "completed",
+        }
+        message = new_message(
+            "assistant",
+            "现在是 20:00。",
+            activity_blocks=[activity],
+        )
+        activity["status"] = "failed"
+        self.assertEqual(message["activity_blocks"][0]["status"], "completed")
+
+        session = self.store.new_session()
+        session["messages"] = [message]
+        self.assertNotIn("activity_blocks", build_api_messages(session)[0])
+
 
 class SessionValidationTests(unittest.TestCase):
     def test_turn_records_are_valid_on_brainstorm_sessions(self) -> None:

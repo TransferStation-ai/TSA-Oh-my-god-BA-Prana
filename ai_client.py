@@ -17,6 +17,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import copilot_provider
+import providers
 import settings_store
 import responses_adapter
 import streaming
@@ -28,6 +30,7 @@ from brainstorm import (
 )
 from skills import (
     CHAT_SKILLS,
+    CNKI_SKILLS,
     DESKTOP_SKILLS,
     GAME_SKILLS,
     GIT_SKILLS,
@@ -43,6 +46,7 @@ from skills import (
     GameSessionAccess,
     ModelingSessionAccess,
     invoke_desktop_skill,
+    invoke_cnki_skill,
     invoke_game_skill,
     invoke_git_skill,
     invoke_media_skill,
@@ -715,6 +719,23 @@ class AIClient:
             raise ValueError("链接提供商配置格式无效。")
         self.linked_providers = configured_providers
         self._validate_linked_providers(self.linked_providers)
+        configured_vault = settings.get("provider_vault", {})
+        if not isinstance(configured_vault, dict) or not all(
+            isinstance(key, str) and isinstance(entry, dict)
+            for key, entry in configured_vault.items()
+        ):
+            raise ValueError("提供商库配置格式无效。")
+        self.provider_vault: dict[str, dict[str, object]] = {
+            key: dict(entry) for key, entry in configured_vault.items()
+        }
+        self.vault_key = providers.resolve_main_vault_key(self.base_url)
+        current_vault_entry = self.provider_vault.get(self.vault_key, {})
+        stored_models = current_vault_entry.get("models", [])
+        self.model_catalog = (
+            [dict(item) for item in stored_models if isinstance(item, dict)]
+            if isinstance(stored_models, list)
+            else []
+        )
         configured_subagents = settings.get("subagents", [])
         if not isinstance(configured_subagents, list):
             raise ValueError("子代理配置格式无效。")
@@ -734,7 +755,8 @@ class AIClient:
 
     @property
     def configuration_error(self) -> str | None:
-        if not self.api_key:
+        preset = providers.provider_for_base_url(str(self.base_url))
+        if not self.api_key and (preset is None or preset.requires_api_key):
             return "尚未配置 API Key。请点击右上角“设置”进行配置。"
         if not self.base_url:
             return "AI 服务地址为空，请在设置中检查 API 地址。"
@@ -753,6 +775,8 @@ class AIClient:
         review_model: str | None = None,
         brainstorm_rounds: int | None = None,
         linked_providers: list[dict[str, object]] | None = None,
+        models: list[dict[str, str]] | None = None,
+        vault_key: str | None = None,
         game: dict[str, object] | None = None,
         modeling: dict[str, object] | None = None,
     ) -> None:
@@ -762,15 +786,18 @@ class AIClient:
         image_model = self.image_model if image_model is None else image_model.strip()
         video_model = self.video_model if video_model is None else video_model.strip()
         review_model = self.review_model if review_model is None else review_model.strip()
-        if not api_key:
+        preset = providers.provider_for_base_url(base_url)
+        requires_api_key = preset is None or preset.requires_api_key
+        supports_media = preset is None or preset.supports_media
+        if not api_key and requires_api_key:
             raise ValueError("API Key 不能为空。")
         if not base_url:
             raise ValueError("API 地址不能为空。")
         if not model:
             raise ValueError("模型名称不能为空。")
-        if not image_model:
+        if not image_model and supports_media:
             raise ValueError("图片生成模型名称不能为空。")
-        if not video_model:
+        if not video_model and supports_media:
             raise ValueError("视频生成模型名称不能为空。")
 
         if subagents is None:
@@ -798,7 +825,7 @@ class AIClient:
             extra_settings["game"] = game
         if modeling is not None:
             extra_settings["modeling"] = modeling
-        settings_store.save_settings(
+        self.provider_vault = settings_store.save_settings(
             api_key,
             base_url,
             model,
@@ -808,6 +835,9 @@ class AIClient:
             review_model,
             brainstorm_rounds=brainstorm_rounds,
             linked_providers=linked_providers,
+            provider_vault=self.provider_vault,
+            vault_models=models,
+            vault_key=vault_key,
             **extra_settings,
         )
         self.api_key = api_key
@@ -819,6 +849,14 @@ class AIClient:
         self.subagents = subagents
         self.brainstorm_rounds = brainstorm_rounds
         self.linked_providers = linked_providers
+        self.vault_key = vault_key or providers.resolve_main_vault_key(base_url)
+        current_vault_entry = self.provider_vault.get(self.vault_key, {})
+        stored_models = current_vault_entry.get("models", [])
+        self.model_catalog = (
+            [dict(item) for item in stored_models if isinstance(item, dict)]
+            if isinstance(stored_models, list)
+            else []
+        )
         if game is not None:
             self.game_settings = settings_store.normalize_game(game)
         if modeling is not None:
@@ -828,6 +866,9 @@ class AIClient:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("请输入图片描述。")
+        preset = providers.provider_for_base_url(str(self.base_url))
+        if preset is not None and not preset.supports_media:
+            raise RuntimeError("当前 GitHub Copilot 提供商不支持图片生成。")
         if not self.image_model:
             raise RuntimeError("请在设置中填写图片生成模型名称。")
         payload = self._api_request(
@@ -861,6 +902,9 @@ class AIClient:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("请先输入视频描述。")
+        preset = providers.provider_for_base_url(str(self.base_url))
+        if preset is not None and not preset.supports_media:
+            raise RuntimeError("当前 GitHub Copilot 提供商不支持视频生成。")
         if not self.video_model:
             raise RuntimeError("请在设置中填写视频生成模型名称。")
         is_agnes_video = self.video_model == "agnes-video-2.5"
@@ -1377,6 +1421,9 @@ class AIClient:
     def fetch_main_provider_models(self) -> list[dict[str, str]]:
         if self.configuration_error is not None:
             raise RuntimeError(self.configuration_error)
+        preset = providers.provider_for_base_url(str(self.base_url))
+        if preset is not None and preset.driver == "copilot-sdk":
+            return copilot_provider.fetch_models()
         request = urllib.request.Request(
             f"{self.base_url}/models",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -1420,6 +1467,65 @@ class AIClient:
             if not model_id:
                 continue
             models.append({"id": model_id, "name": name})
+            if len(models) >= 200:
+                break
+        if not models:
+            raise RuntimeError("AI 服务没有返回可用模型。")
+        return models
+
+    def fetch_provider_models(
+        self, base_url: str, api_key: str
+    ) -> list[dict[str, str]]:
+        address = providers.normalize_base_url(base_url)
+        preset = providers.provider_for_base_url(address)
+        if preset is not None and preset.driver == "copilot-sdk":
+            return copilot_provider.fetch_models()
+        if not address:
+            raise ValueError("AI 服务地址为空。")
+        if not api_key.strip():
+            raise RuntimeError("请先填写该提供商的 API Key。")
+        request = urllib.request.Request(
+            f"{address}/models",
+            headers={"Authorization": f"Bearer {api_key.strip()}"},
+        )
+        try:
+            with self._open_authenticated_request(
+                request, timeout=30
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            raise self._http_error(error) from error
+        except urllib.error.URLError as error:
+            raise RuntimeError(
+                f"无法连接 AI 服务：{error.reason}"
+            ) from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "AI 服务返回了无法解析的模型列表。"
+            ) from error
+        items: object = payload
+        if isinstance(payload, dict):
+            items = payload.get("data")
+            if items is None:
+                items = payload.get("models")
+        if not isinstance(items, list):
+            raise RuntimeError("AI 服务返回的模型列表格式无效。")
+        models: list[dict[str, str]] = []
+        for item in items:
+            if isinstance(item, str):
+                model_id = item.strip()
+                name = model_id
+            elif isinstance(item, dict):
+                raw_id = item.get("id")
+                if not isinstance(raw_id, str):
+                    continue
+                model_id = raw_id.strip()
+                raw_name = item.get("name", model_id)
+                name = str(raw_name).strip() or model_id
+            else:
+                continue
+            if model_id:
+                models.append({"id": model_id, "name": name})
             if len(models) >= 200:
                 break
         if not models:
@@ -1536,9 +1642,9 @@ class AIClient:
             and self.has_brainstorm_participants
         ):
             tool_list += [BRAINSTORM_TOOL]
+        tool_list += MINECRAFT_WIKI_SKILLS + CNKI_SKILLS
         if game_session is not None:
             tool_list += GAME_SKILLS
-            tool_list += MINECRAFT_WIKI_SKILLS
         tool_list += modeling_tool_list(modeling_session)
         known_tool_names: set[str] = set()
         for entry in tool_list:
@@ -1555,11 +1661,16 @@ class AIClient:
                 return permanent_root_provider()
             return permanent_root
 
+        def forward_model_event(kind: str, text: str) -> None:
+            if on_event is not None and kind != "reasoning":
+                on_event(kind, text)
+
         desktop_screenshots = 0
         modeling_previews = 0
         for round_index in range(MAX_TOOL_ROUNDS):
             if on_event is not None:
                 on_event("round", "")
+                on_event("reasoning", streaming.PUBLIC_PROGRESS_SUMMARY)
             assistant_message = self._complete_message(
                 working_messages,
                 tools=tool_list,
@@ -1571,7 +1682,7 @@ class AIClient:
                     if forced_tool and round_index == 0
                     else None
                 ),
-                on_event=on_event,
+                on_event=forward_model_event if on_event is not None else None,
                 should_stop=should_stop if should_stop is not None else None,
             )
             tool_calls = assistant_message.get("tool_calls")
@@ -1639,8 +1750,26 @@ class AIClient:
                     or not isinstance(function.get("arguments"), str)
                 ):
                     raise RuntimeError("AI 服务返回了无效的 skill 调用参数。")
+                tool_failed = False
                 try:
                     arguments = json.loads(function["arguments"])
+                    if on_event is not None:
+                        argument_text = json.dumps(
+                            arguments, ensure_ascii=False, separators=(",", ":")
+                        )
+                        if len(argument_text) > 1600:
+                            argument_text = argument_text[:1599] + "…"
+                        on_event(
+                            "tool_start",
+                            json.dumps(
+                                {
+                                    "id": call_id,
+                                    "name": function["name"],
+                                    "arguments": argument_text,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
                     if function["name"] in LOCAL_FILE_SKILLS:
                         self._review_local_file_operation(
                             function["name"], arguments, working_messages
@@ -1755,6 +1884,9 @@ class AIClient:
                     elif function["name"] == "search_minecraft_wiki":
                         result = invoke_minecraft_wiki_skill(arguments)
                         media_paths = []
+                    elif function["name"] == "search_cnki":
+                        result = invoke_cnki_skill(arguments)
+                        media_paths = []
                     elif function["name"] in _MODELING_TOOL_NAMES:
                         if modeling_session is None:
                             raise RuntimeError("当前会话不支持建模。")
@@ -1857,11 +1989,33 @@ class AIClient:
                     RuntimeError,
                     OSError,
                 ) as error:
+                    tool_failed = True
                     result = json.dumps(
                         {"error": str(error)}, ensure_ascii=False
                     )
+                except Exception:
+                    if on_event is not None:
+                        on_event(
+                            "tool_finish",
+                            json.dumps(
+                                {"id": call_id, "status": "failed"},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    raise
                 else:
                     response_media.extend(media_paths)
+                if on_event is not None:
+                    on_event(
+                        "tool_finish",
+                        json.dumps(
+                            {
+                                "id": call_id,
+                                "status": "failed" if tool_failed else "completed",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
                 result = self._strip_tool_debug_markup(result)
                 round_result_message = {
                     "role": "tool",
@@ -2738,8 +2892,17 @@ class AIClient:
         on_event: Callable[[str, str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
+        if on_event is not None:
+            on_event("round", "")
+            on_event("reasoning", streaming.PUBLIC_PROGRESS_SUMMARY)
+
+            def forward_public_event(kind: str, text: str) -> None:
+                if kind != "reasoning":
+                    on_event(kind, text)
+        else:
+            forward_public_event = None
         response_message = self._complete_message(
-            messages, on_event=on_event, should_stop=should_stop
+            messages, on_event=forward_public_event, should_stop=should_stop
         )
         content = response_message.get("content")
         if not isinstance(content, str) or not content.strip():
@@ -2789,10 +2952,15 @@ class AIClient:
             for attempt in range(MAX_CHAT_REQUEST_ATTEMPTS):
                 try:
                     return self._complete_message_once(
-                        messages, tools=tools, tool_choice=tool_choice
+                        messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        should_stop=should_stop,
                     )
                 except RuntimeError as error:
                     last_error = error
+                    if should_stop is not None and should_stop():
+                        raise
                     if attempt < MAX_CHAT_REQUEST_ATTEMPTS - 1:
                         time.sleep(RETRY_DELAY_SECONDS[attempt])
             if last_error is not None:
@@ -2856,7 +3024,17 @@ class AIClient:
         tools: list[dict[str, object]] | None = None,
         tool_choice: dict[str, object] | str | None = None,
         reasoning_out: list[str] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> dict[str, object]:
+        preset = providers.provider_for_base_url(str(self.base_url))
+        if preset is not None and preset.driver == "copilot-sdk":
+            return copilot_provider.complete(
+                messages,
+                model=str(self.model),
+                tools=tools,
+                tool_choice=tool_choice,
+                should_stop=should_stop,
+            )
         request_payload, endpoint, use_responses = self._build_request_payload(
             messages, tools=tools, tool_choice=tool_choice
         )
@@ -2923,9 +3101,33 @@ class AIClient:
         should_stop: Callable[[], bool] | None,
         emitted: list[bool],
     ) -> dict[str, object]:
+        preset = providers.provider_for_base_url(str(self.base_url))
+        if preset is not None and preset.driver == "copilot-sdk":
+            result = copilot_provider.complete(
+                messages,
+                model=str(self.model),
+                tools=tools,
+                tool_choice=tool_choice,
+                should_stop=should_stop,
+            )
+            content = result.get("content")
+            if isinstance(content, str) and content:
+                on_event("content", content)
+                emitted[0] = True
+            return result
         request_payload, endpoint, use_responses = self._build_request_payload(
             messages, tools=tools, tool_choice=tool_choice
         )
+        reasoning_progress_sent = [False]
+
+        def emit_event(kind: str, text: str) -> None:
+            if kind == "reasoning":
+                if reasoning_progress_sent[0]:
+                    return
+                reasoning_progress_sent[0] = True
+                text = streaming.PUBLIC_PROGRESS_SUMMARY
+            on_event(kind, text)
+
         request_payload["stream"] = True
         request = urllib.request.Request(
             f"{self.base_url}/{endpoint}",
@@ -2951,14 +3153,15 @@ class AIClient:
                     tools=tools,
                     tool_choice=tool_choice,
                     reasoning_out=reasoning_out,
+                    should_stop=should_stop,
                 )
                 for reasoning in reasoning_out:
                     if reasoning:
-                        on_event("reasoning", reasoning)
+                        emit_event("reasoning", reasoning)
                         emitted[0] = True
                 content = result.get("content")
                 if isinstance(content, str) and content:
-                    on_event("content", content)
+                    emit_event("content", content)
                     emitted[0] = True
                 return result
             details = error.read().decode("utf-8", errors="replace")
@@ -2993,7 +3196,7 @@ class AIClient:
                     )
                     reasoning = streaming.responses_reasoning_text(payload)
                     if reasoning:
-                        on_event("reasoning", reasoning)
+                        emit_event("reasoning", reasoning)
                         emitted[0] = True
                 else:
                     try:
@@ -3006,11 +3209,11 @@ class AIClient:
                         raise RuntimeError("AI 服务返回了无效的 assistant 消息。")
                     reasoning = streaming.chat_reasoning_text(result)
                     if reasoning:
-                        on_event("reasoning", reasoning)
+                        emit_event("reasoning", reasoning)
                         emitted[0] = True
                 content = result.get("content")
                 if isinstance(content, str) and content:
-                    on_event("content", content)
+                    emit_event("content", content)
                     emitted[0] = True
                 return result
 
@@ -3032,8 +3235,9 @@ class AIClient:
                     else:
                         events = stream.feed(data)
                     for kind, text in events:
-                        emitted[0] = True
-                        on_event(kind, text)
+                        if kind != "reasoning" or not reasoning_progress_sent[0]:
+                            emitted[0] = True
+                        emit_event(kind, text)
                     if should_stop is not None and should_stop():
                         break
             except (OSError, UnicodeDecodeError) as error:

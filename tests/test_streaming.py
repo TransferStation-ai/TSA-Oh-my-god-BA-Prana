@@ -8,6 +8,8 @@ from streaming import (
     chat_reasoning_text,
     format_reasoning_duration,
     iter_sse,
+    normalize_activity_blocks,
+    normalize_public_progress_blocks,
     normalize_reasoning_blocks,
     reasoning_heading,
     responses_reasoning_text,
@@ -180,6 +182,47 @@ class DisplayLogicTests(unittest.TestCase):
         )
         self.assertEqual(normalize_reasoning_blocks(None), [])
 
+    def test_normalize_activity_blocks_validates_saved_tool_details(self) -> None:
+        self.assertEqual(
+            normalize_activity_blocks([
+                {
+                    "id": "call-1",
+                    "name": "read_git_repository",
+                    "arguments": '{"action":"status"}',
+                    "status": "completed",
+                },
+                {"name": "incomplete"},
+                {
+                    "id": "call-2",
+                    "name": "bad",
+                    "arguments": "{}",
+                    "status": "unknown",
+                },
+            ]),
+            [{
+                "id": "call-1",
+                "name": "read_git_repository",
+                "arguments": '{"action":"status"}',
+                "status": "completed",
+            }],
+        )
+        self.assertEqual(normalize_activity_blocks(None), [])
+
+    def test_public_progress_hides_legacy_private_reasoning(self) -> None:
+        self.assertEqual(
+            normalize_public_progress_blocks([
+                {"text": "旧版内部推理原文", "seconds": 2},
+                {
+                    "text": "正在分析请求并规划下一步。",
+                    "seconds": 3,
+                },
+            ]),
+            [{
+                "text": "正在分析请求并规划下一步。",
+                "seconds": 3.0,
+            }],
+        )
+
     def test_should_follow(self) -> None:
         self.assertTrue(should_follow(1.0))
         self.assertTrue(should_follow(0.98))
@@ -263,3 +306,38 @@ class StreamStateTests(unittest.TestCase):
             [("finish_reasoning", {"text": "再想一遍", "seconds": 1.0})],
         )
         self.assertEqual(state.finish(21.0), [])
+
+    def test_tool_activity_tracks_arguments_and_completion(self) -> None:
+        state = StreamState()
+        actions = state.apply(
+            "tool_start",
+            json.dumps({
+                "id": "call-1",
+                "name": "search_workspace_files",
+                "arguments": '{"query":"README"}',
+            }),
+            1.0,
+        )
+        self.assertEqual(actions[0][0], "tool_start")
+        self.assertEqual(state.activity_blocks[0]["status"], "running")
+        actions = state.apply(
+            "tool_finish",
+            json.dumps({"id": "call-1", "status": "completed"}),
+            2.0,
+        )
+        self.assertEqual(actions[0][0], "tool_finish")
+        self.assertEqual(state.activity_blocks[0]["status"], "completed")
+
+    def test_finish_marks_unfinished_tool_as_interrupted(self) -> None:
+        state = StreamState()
+        state.apply(
+            "tool_start",
+            json.dumps({
+                "id": "call-1",
+                "name": "search_workspace_files",
+                "arguments": "{}",
+            }),
+            1.0,
+        )
+        state.finish(2.0)
+        self.assertEqual(state.activity_blocks[0]["status"], "interrupted")

@@ -2,7 +2,7 @@
 
 一个计划开发为开源 AI 编码工具的 Windows 桌面项目。Prana 希望成为一位桌面 AI 助手，帮助开发者理解和处理代码项目；项目方向受到 [OpenCode](https://github.com/anomalyco/opencode) 等工具启发，但将独立设计和实现。
 
-目前提供可运行的桌面聊天界面，并接入兼容 OpenAI Chat Completions API 的模型服务。项目仍在开发中，功能和范围可能变化。
+目前提供可运行的桌面聊天界面，支持兼容 OpenAI Chat Completions API 的模型服务，以及通过 GitHub 官方 Copilot SDK/CLI 使用 Copilot 订阅。项目仍在开发中，功能和范围可能变化。
 
 
 ## 文档
